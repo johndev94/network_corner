@@ -74,6 +74,13 @@ namespace NetworkCorner
         public override string ToString() { return Kind + " — " + Name; }
     }
 
+    internal sealed class ScanNetworkOption
+    {
+        public string Label;
+        public string Target;
+        public override string ToString() { return Label; }
+    }
+
     internal static class NetworkReader
     {
         public static List<AdapterInfo> GetAdapters()
@@ -262,6 +269,80 @@ namespace NetworkCorner
         private static string FirstNonEmpty(string a, string b) { return !String.IsNullOrWhiteSpace(a) ? a.Trim() : b.Trim(); }
     }
 
+    internal static class NmapSupport
+    {
+        public static string FindExecutable()
+        {
+            string[] candidates =
+            {
+                @"C:\Program Files (x86)\Nmap\nmap.exe",
+                @"C:\Program Files\Nmap\nmap.exe"
+            };
+            foreach (string candidate in candidates) if (File.Exists(candidate)) return candidate;
+            string path = Environment.GetEnvironmentVariable("PATH") ?? "";
+            foreach (string folder in path.Split(Path.PathSeparator))
+            {
+                try
+                {
+                    string candidate = Path.Combine(folder.Trim(), "nmap.exe");
+                    if (File.Exists(candidate)) return candidate;
+                }
+                catch { }
+            }
+            return null;
+        }
+
+        public static string ValidateTarget(string target)
+        {
+            if (String.IsNullOrWhiteSpace(target)) return "Enter a scan target.";
+            target = target.Trim();
+            if (target.Length > 255) return "The scan target is too long.";
+            if (target.StartsWith("-")) return "The scan target cannot start with a dash.";
+            foreach (char c in target)
+            {
+                if (!(Char.IsLetterOrDigit(c) || c == '.' || c == '-' || c == '_' || c == ':' || c == '/' || c == '%'))
+                    return "Use a hostname, IPv4/IPv6 address, or CIDR range without spaces.";
+            }
+            return null;
+        }
+
+        public static string ArgumentsFor(int presetIndex, string target)
+        {
+            string options;
+            switch (presetIndex)
+            {
+                case 0: options = "-sn --reason"; break;
+                case 1: options = "-sT --top-ports 100 --reason -T4"; break;
+                case 2: options = "-sT --reason -T4"; break;
+                case 3: options = "-sT -sV --top-ports 100 --reason -T4"; break;
+                default: throw new ArgumentOutOfRangeException("presetIndex");
+            }
+            return options + " " + target.Trim();
+        }
+
+        public static string NetworkTarget(string address, string mask)
+        {
+            if (!RequestValidator.IsIpv4(address) || !RequestValidator.IsIpv4(mask)) return null;
+            byte[] addressBytes = IPAddress.Parse(address).GetAddressBytes();
+            byte[] maskBytes = IPAddress.Parse(mask).GetAddressBytes();
+            byte[] networkBytes = new byte[4];
+            int prefix = 0;
+            bool sawZero = false;
+            for (int i = 0; i < 4; i++)
+            {
+                networkBytes[i] = (byte)(addressBytes[i] & maskBytes[i]);
+                for (int bit = 7; bit >= 0; bit--)
+                {
+                    bool one = (maskBytes[i] & (1 << bit)) != 0;
+                    if (one && sawZero) return null;
+                    if (one) prefix++; else sawZero = true;
+                }
+            }
+            if (prefix == 0) return null;
+            return new IPAddress(networkBytes).ToString() + "/" + prefix;
+        }
+    }
+
     internal sealed class MainForm : Form
     {
         private readonly Color Back = Color.FromArgb(20, 25, 32);
@@ -281,12 +362,20 @@ namespace NetworkCorner
         private readonly TextBox dns1Box = new TextBox();
         private readonly TextBox dns2Box = new TextBox();
         private readonly RichTextBox summaryBox = new RichTextBox();
+        private readonly TextBox scanTargetBox = new TextBox();
+        private readonly ComboBox scanNetworkBox = new ComboBox();
+        private readonly ComboBox scanPresetBox = new ComboBox();
+        private readonly RichTextBox scanOutputBox = new RichTextBox();
+        private readonly Label scanStatusLabel = new Label();
+        private Button scanStartButton;
+        private Button scanCancelButton;
         private readonly Label updatedLabel = new Label();
         private readonly Timer refreshTimer = new Timer();
         private List<AdapterInfo> adapters = new List<AdapterInfo>();
         private List<NetworkProfile> profiles = new List<NetworkProfile>();
         private bool loading;
         private int normalHeight;
+        private Process currentScan;
         private readonly string profilePath;
 
         public MainForm()
@@ -311,18 +400,30 @@ namespace NetworkCorner
             refreshTimer.Tick += delegate { RefreshAdapters(false); };
             refreshTimer.Start();
             Shown += delegate { normalHeight = Height; DockToCorner(); };
-            FormClosed += delegate { summaryRegularFont.Dispose(); summaryBoldFont.Dispose(); };
+            FormClosed += delegate
+            {
+                if (currentScan != null && !currentScan.HasExited) currentScan.Kill();
+                summaryRegularFont.Dispose();
+                summaryBoldFont.Dispose();
+            };
         }
 
         private void BuildUi()
         {
+            var tabs = new TabControl { Dock = DockStyle.Fill, Appearance = TabAppearance.Normal };
+            var networkTab = new TabPage("Network") { BackColor = Back, ForeColor = Color.White };
+            var scanTab = new TabPage("Nmap Scan") { BackColor = Back, ForeColor = Color.White };
+            tabs.TabPages.Add(networkTab);
+            tabs.TabPages.Add(scanTab);
+            Controls.Add(tabs);
+
             var root = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(14), ColumnCount = 1, RowCount = 5, BackColor = Back };
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 340));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 60));
-            Controls.Add(root);
+            networkTab.Controls.Add(root);
 
             var titlePanel = new Panel { Dock = DockStyle.Fill };
             var title = new Label { Text = "NETWORK CORNER", Font = new Font("Segoe UI Semibold", 14F), AutoSize = true, Location = new Point(0, 2), ForeColor = Color.White };
@@ -405,6 +506,216 @@ namespace NetworkCorner
             actions.Controls.Add(MakeButton("Use DHCP", delegate { Apply(true); }, false, 0), 1, 0);
             actions.Controls.Add(MakeButton("↻", delegate { RefreshAdapters(true); }, false, 0), 2, 0);
             root.Controls.Add(actions, 0, 4);
+
+            BuildScanTab(scanTab);
+        }
+
+        private void BuildScanTab(TabPage scanTab)
+        {
+            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(14), ColumnCount = 1, RowCount = 6, BackColor = Back };
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 56));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 56));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 56));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 55));
+            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            scanTab.Controls.Add(layout);
+
+            var heading = new Panel { Dock = DockStyle.Fill };
+            heading.Controls.Add(new Label { Text = "NMAP SCANNER", Font = new Font("Segoe UI Semibold", 14F), AutoSize = true, Location = new Point(0, 2), ForeColor = Color.White });
+            scanStatusLabel.Text = File.Exists(NmapSupport.FindExecutable()) ? "Ready • Nmap detected" : "Nmap was not found";
+            scanStatusLabel.AutoSize = true;
+            scanStatusLabel.Location = new Point(2, 31);
+            scanStatusLabel.ForeColor = Muted;
+            heading.Controls.Add(scanStatusLabel);
+            layout.Controls.Add(heading, 0, 0);
+
+            var networkRow = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, BackColor = Back, Padding = new Padding(0, 6, 0, 6) };
+            networkRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 92));
+            networkRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            networkRow.Controls.Add(FieldLabel("NETWORK"), 0, 0);
+            StyleCombo(scanNetworkBox);
+            scanNetworkBox.Dock = DockStyle.Fill;
+            scanNetworkBox.SelectedIndexChanged += delegate
+            {
+                if (loading) return;
+                ScanNetworkOption option = scanNetworkBox.SelectedItem as ScanNetworkOption;
+                if (option != null && !String.IsNullOrWhiteSpace(option.Target))
+                {
+                    loading = true;
+                    scanTargetBox.Text = option.Target;
+                    loading = false;
+                }
+            };
+            networkRow.Controls.Add(scanNetworkBox, 1, 0);
+            layout.Controls.Add(networkRow, 0, 1);
+
+            var targetRow = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, BackColor = Back, Padding = new Padding(0, 6, 0, 6) };
+            targetRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 92));
+            targetRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            targetRow.Controls.Add(FieldLabel("TARGET"), 0, 0);
+            scanTargetBox.Dock = DockStyle.Fill;
+            scanTargetBox.BorderStyle = BorderStyle.FixedSingle;
+            scanTargetBox.BackColor = Color.FromArgb(42, 50, 62);
+            scanTargetBox.ForeColor = Color.White;
+            scanTargetBox.Text = "192.168.1.0/24";
+            scanTargetBox.TextChanged += delegate
+            {
+                if (loading || scanNetworkBox.SelectedIndex < 0) return;
+                ScanNetworkOption option = scanNetworkBox.SelectedItem as ScanNetworkOption;
+                if (option != null && !String.IsNullOrWhiteSpace(option.Target) && !String.Equals(option.Target, scanTargetBox.Text.Trim(), StringComparison.OrdinalIgnoreCase))
+                    scanNetworkBox.SelectedIndex = 0;
+            };
+            targetRow.Controls.Add(scanTargetBox, 1, 0);
+            layout.Controls.Add(targetRow, 0, 2);
+
+            var presetRow = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, BackColor = Back, Padding = new Padding(0, 6, 0, 6) };
+            presetRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 92));
+            presetRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            presetRow.Controls.Add(FieldLabel("SCAN TYPE"), 0, 0);
+            StyleCombo(scanPresetBox);
+            scanPresetBox.Dock = DockStyle.Fill;
+            scanPresetBox.Items.AddRange(new object[] { "Discover devices", "Quick ports", "Standard ports", "Services + versions" });
+            scanPresetBox.SelectedIndex = 0;
+            presetRow.Controls.Add(scanPresetBox, 1, 0);
+            layout.Controls.Add(presetRow, 0, 3);
+
+            var buttons = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, BackColor = Back, Padding = new Padding(0, 7, 0, 7) };
+            buttons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 42));
+            buttons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 30));
+            buttons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 28));
+            scanStartButton = MakeButton("Start scan", delegate { StartScan(); }, true, 0);
+            scanCancelButton = MakeButton("Cancel", delegate { CancelScan(); }, false, 0);
+            scanCancelButton.Enabled = false;
+            buttons.Controls.Add(scanStartButton, 0, 0);
+            buttons.Controls.Add(scanCancelButton, 1, 0);
+            buttons.Controls.Add(MakeButton("Use gateway", delegate { UseGatewayTarget(); }, false, 0), 2, 0);
+            layout.Controls.Add(buttons, 0, 4);
+
+            var outputPanel = Card();
+            scanOutputBox.Dock = DockStyle.Fill;
+            scanOutputBox.ReadOnly = true;
+            scanOutputBox.BackColor = Color.FromArgb(15, 20, 26);
+            scanOutputBox.ForeColor = Color.FromArgb(214, 225, 235);
+            scanOutputBox.BorderStyle = BorderStyle.None;
+            scanOutputBox.Font = summaryRegularFont;
+            scanOutputBox.WordWrap = false;
+            scanOutputBox.ScrollBars = RichTextBoxScrollBars.Both;
+            scanOutputBox.DetectUrls = false;
+            scanOutputBox.Text = "Enter a hostname, IPv4 address, or CIDR range, then choose a scan type.\r\nOnly scan networks and devices you are authorised to test.";
+            outputPanel.Controls.Add(scanOutputBox);
+            layout.Controls.Add(outputPanel, 0, 5);
+        }
+
+        private void StartScan()
+        {
+            if (currentScan != null && !currentScan.HasExited) return;
+            string target = scanTargetBox.Text.Trim();
+            string validation = NmapSupport.ValidateTarget(target);
+            if (validation != null)
+            {
+                MessageBox.Show(validation, "Check scan target", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            string executable = NmapSupport.FindExecutable();
+            if (String.IsNullOrWhiteSpace(executable))
+            {
+                MessageBox.Show("Nmap was not found. Install Nmap for Windows and reopen Network Corner.", "Nmap unavailable", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            scanOutputBox.Clear();
+            AppendScanOutput("Scanning " + target + " using “" + scanPresetBox.SelectedItem + "”…\r\n\r\n", Accent);
+            var process = new Process();
+            process.StartInfo = new ProcessStartInfo(executable, NmapSupport.ArgumentsFor(scanPresetBox.SelectedIndex, target));
+            process.StartInfo.UseShellExecute = false;
+            process.StartInfo.CreateNoWindow = true;
+            process.StartInfo.RedirectStandardOutput = true;
+            process.StartInfo.RedirectStandardError = true;
+            process.EnableRaisingEvents = true;
+            process.OutputDataReceived += delegate(object sender, DataReceivedEventArgs e) { if (e.Data != null) AppendScanOutputSafe(e.Data + "\r\n", Color.FromArgb(214, 225, 235)); };
+            process.ErrorDataReceived += delegate(object sender, DataReceivedEventArgs e) { if (e.Data != null) AppendScanOutputSafe(e.Data + "\r\n", Color.FromArgb(255, 130, 130)); };
+            process.Exited += delegate(object sender, EventArgs e)
+            {
+                int exitCode = process.ExitCode;
+                try
+                {
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        scanStatusLabel.Text = exitCode == 0 ? "Scan complete" : "Scan stopped • exit code " + exitCode;
+                        scanStatusLabel.ForeColor = exitCode == 0 ? Color.FromArgb(92, 214, 147) : Color.FromArgb(255, 190, 83);
+                        scanStartButton.Enabled = true;
+                        scanCancelButton.Enabled = false;
+                        AppendScanOutput("\r\n" + scanStatusLabel.Text + ".\r\n", scanStatusLabel.ForeColor);
+                        currentScan = null;
+                        process.Dispose();
+                    });
+                }
+                catch { process.Dispose(); }
+            };
+
+            try
+            {
+                currentScan = process;
+                process.Start();
+                process.BeginOutputReadLine();
+                process.BeginErrorReadLine();
+                scanStatusLabel.Text = "Scanning " + target + "…";
+                scanStatusLabel.ForeColor = Color.FromArgb(74, 193, 255);
+                scanStartButton.Enabled = false;
+                scanCancelButton.Enabled = true;
+            }
+            catch (Exception ex)
+            {
+                currentScan = null;
+                process.Dispose();
+                scanStartButton.Enabled = true;
+                scanCancelButton.Enabled = false;
+                MessageBox.Show(ex.Message, "Could not start Nmap", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void CancelScan()
+        {
+            try
+            {
+                if (currentScan != null && !currentScan.HasExited)
+                {
+                    scanStatusLabel.Text = "Cancelling scan…";
+                    currentScan.Kill();
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(ex.Message, "Could not cancel scan", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void UseGatewayTarget()
+        {
+            AdapterInfo selected = adapterBox.SelectedItem as AdapterInfo;
+            if (selected == null || String.IsNullOrWhiteSpace(selected.Gateway))
+            {
+                MessageBox.Show("The selected adapter does not currently report an IPv4 gateway.", "Gateway unavailable", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            scanTargetBox.Text = selected.Gateway;
+        }
+
+        private void AppendScanOutputSafe(string text, Color color)
+        {
+            try { BeginInvoke((MethodInvoker)delegate { AppendScanOutput(text, color); }); }
+            catch { }
+        }
+
+        private void AppendScanOutput(string text, Color color)
+        {
+            scanOutputBox.SelectionStart = scanOutputBox.TextLength;
+            scanOutputBox.SelectionLength = 0;
+            scanOutputBox.SelectionColor = color;
+            scanOutputBox.AppendText(text);
+            scanOutputBox.SelectionStart = scanOutputBox.TextLength;
+            scanOutputBox.ScrollToCaret();
         }
 
         private Panel Card()
@@ -484,8 +795,40 @@ namespace NetworkCorner
             int index = adapters.FindIndex(x => x.Name == selected);
             if (index < 0 && adapters.Count > 0) index = 0;
             if (index >= 0) adapterBox.SelectedIndex = index;
+            RefreshScanNetworks();
             loading = false;
             if (populate) PopulateFields();
+        }
+
+        private void RefreshScanNetworks()
+        {
+            string selectedTarget = null;
+            ScanNetworkOption selected = scanNetworkBox.SelectedItem as ScanNetworkOption;
+            if (selected != null) selectedTarget = selected.Target;
+
+            scanNetworkBox.Items.Clear();
+            scanNetworkBox.Items.Add(new ScanNetworkOption { Label = "Manual target", Target = null });
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (AdapterInfo adapter in adapters)
+            {
+                string target = NmapSupport.NetworkTarget(adapter.Address, adapter.Mask);
+                if (String.IsNullOrWhiteSpace(target) || !seen.Add(target)) continue;
+                scanNetworkBox.Items.Add(new ScanNetworkOption
+                {
+                    Label = adapter.Kind + " — " + adapter.Name + " — " + target,
+                    Target = target
+                });
+            }
+            int selectedIndex = 0;
+            if (!String.IsNullOrWhiteSpace(selectedTarget))
+            {
+                for (int i = 1; i < scanNetworkBox.Items.Count; i++)
+                {
+                    ScanNetworkOption option = scanNetworkBox.Items[i] as ScanNetworkOption;
+                    if (option != null && String.Equals(option.Target, selectedTarget, StringComparison.OrdinalIgnoreCase)) { selectedIndex = i; break; }
+                }
+            }
+            scanNetworkBox.SelectedIndex = selectedIndex;
         }
 
         private static string Empty(string value) { return String.IsNullOrWhiteSpace(value) ? "—" : value; }
@@ -681,6 +1024,11 @@ namespace NetworkCorner
             failures += Check(dhcp.Count == 2 && dhcp[0].Contains("source=dhcp"), "DHCP commands");
             var stat = NetworkChanger.BuildCommands(new ChangeRequest { Adapter = "Ethernet", Address = "10.0.0.2", Mask = "255.255.255.0", Gateway = "10.0.0.1", Dns1 = "1.1.1.1", Dns2 = "8.8.8.8" });
             failures += Check(stat.Count == 3 && stat[2].Contains("index=2"), "static commands");
+            failures += Check(NmapSupport.ValidateTarget("192.168.1.0/24") == null, "valid Nmap CIDR target");
+            failures += Check(NmapSupport.ValidateTarget("-iL file.txt") != null, "reject Nmap option injection");
+            failures += Check(NmapSupport.ArgumentsFor(1, "router.local").Contains("--top-ports 100"), "Nmap quick scan preset");
+            failures += Check(NmapSupport.NetworkTarget("192.168.8.42", "255.255.255.0") == "192.168.8.0/24", "derive Nmap network target");
+            failures += Check(NmapSupport.NetworkTarget("10.20.31.4", "255.255.240.0") == "10.20.16.0/20", "derive non-/24 network target");
             Console.WriteLine(failures == 0 ? "All self-tests passed." : failures + " self-test(s) failed.");
             return failures == 0 ? 0 : 1;
         }

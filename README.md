@@ -10,6 +10,17 @@ Each adapter heading shows both its connection status and how Windows assigns it
 
 The adapter-information area grows with the window. Drag the top or bottom window edge to give it more room, or enable full-height mode to use all remaining vertical space for adapter details.
 
+## Nmap scanning
+
+Open the **Nmap Scan** tab and choose a detected Wi-Fi or Ethernet subnet from **Network**. Network Corner calculates the correct CIDR range from that adapter's current IP address and subnet mask. Choose **Manual target** to scan a custom hostname, individual IP address, or CIDR range. Four presets are available:
+
+- **Discover devices** finds responsive hosts without scanning ports.
+- **Quick ports** checks the 100 most common TCP ports.
+- **Standard ports** runs Nmap's standard TCP port selection.
+- **Services + versions** checks common ports and identifies listening services.
+
+**Use gateway** copies the selected network adapter's current gateway into the scan target. Scan results stream into the output panel and an active scan can be cancelled. Only scan networks and devices you are authorised to test.
+
 To change settings:
 
 1. Choose the Wi-Fi or Ethernet adapter under **Edit**.

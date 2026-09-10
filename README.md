@@ -8,6 +8,8 @@ Double-click `NetworkCorner.exe`. Choose the monitor and corner from the bottom 
 
 Each adapter heading shows both its connection status and how Windows assigns its IPv4 address, for example `[Connected • Dynamic / DHCP]` or `[Connected • Static]`. Wi-Fi, Ethernet, DHCP, and static states use distinct colours for quick recognition.
 
+Enable **Hide down adapters** to remove disconnected adapters from the information panel, adapter editor, and Nmap network selector. Disable it to show every detected Wi-Fi and Ethernet adapter again.
+
 The adapter-information area grows with the window. Drag the top or bottom window edge to give it more room, or enable full-height mode to use all remaining vertical space for adapter details.
 
 ## Nmap scanning

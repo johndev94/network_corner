@@ -356,6 +356,7 @@ namespace NetworkCorner
         private readonly ComboBox screenBox = new ComboBox();
         private readonly ComboBox cornerBox = new ComboBox();
         private readonly CheckBox fullHeightCheck = new CheckBox();
+        private readonly CheckBox hideDownCheck = new CheckBox();
         private readonly TextBox addressBox = new TextBox();
         private readonly TextBox maskBox = new TextBox();
         private readonly TextBox gatewayBox = new TextBox();
@@ -431,8 +432,16 @@ namespace NetworkCorner
             updatedLabel.AutoSize = true;
             updatedLabel.Location = new Point(2, 29);
             updatedLabel.ForeColor = Muted;
+            hideDownCheck.Text = "Hide down adapters";
+            hideDownCheck.AutoSize = false;
+            hideDownCheck.Width = 128;
+            hideDownCheck.Dock = DockStyle.Right;
+            hideDownCheck.ForeColor = Color.FromArgb(220, 228, 238);
+            hideDownCheck.TextAlign = ContentAlignment.MiddleLeft;
+            hideDownCheck.CheckedChanged += delegate { RefreshAdapters(true); };
             titlePanel.Controls.Add(title);
             titlePanel.Controls.Add(updatedLabel);
+            titlePanel.Controls.Add(hideDownCheck);
             root.Controls.Add(titlePanel, 0, 0);
 
             var statusPanel = Card();
@@ -614,13 +623,13 @@ namespace NetworkCorner
             string validation = NmapSupport.ValidateTarget(target);
             if (validation != null)
             {
-                MessageBox.Show(validation, "Check scan target", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show(this, validation, "Check scan target", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
             string executable = NmapSupport.FindExecutable();
             if (String.IsNullOrWhiteSpace(executable))
             {
-                MessageBox.Show("Nmap was not found. Install Nmap for Windows and reopen Network Corner.", "Nmap unavailable", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show(this, "Nmap was not found. Install Nmap for Windows and reopen Network Corner.", "Nmap unavailable", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
             }
 
@@ -671,7 +680,7 @@ namespace NetworkCorner
                 process.Dispose();
                 scanStartButton.Enabled = true;
                 scanCancelButton.Enabled = false;
-                MessageBox.Show(ex.Message, "Could not start Nmap", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show(this, ex.Message, "Could not start Nmap", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
 
@@ -687,7 +696,7 @@ namespace NetworkCorner
             }
             catch (Exception ex)
             {
-                MessageBox.Show(ex.Message, "Could not cancel scan", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show(this, ex.Message, "Could not cancel scan", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
 
@@ -696,7 +705,7 @@ namespace NetworkCorner
             AdapterInfo selected = adapterBox.SelectedItem as AdapterInfo;
             if (selected == null || String.IsNullOrWhiteSpace(selected.Gateway))
             {
-                MessageBox.Show("The selected adapter does not currently report an IPv4 gateway.", "Gateway unavailable", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show(this, "The selected adapter does not currently report an IPv4 gateway.", "Gateway unavailable", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
             scanTargetBox.Text = selected.Gateway;
@@ -762,7 +771,8 @@ namespace NetworkCorner
         private void RefreshAdapters(bool populate)
         {
             string selected = adapterBox.SelectedItem is AdapterInfo ? ((AdapterInfo)adapterBox.SelectedItem).Name : null;
-            adapters = NetworkReader.GetAdapters();
+            List<AdapterInfo> detectedAdapters = NetworkReader.GetAdapters();
+            adapters = hideDownCheck.Checked ? detectedAdapters.Where(x => x.Status == "Connected").ToList() : detectedAdapters;
             summaryBox.SuspendLayout();
             summaryBox.Clear();
             foreach (AdapterInfo a in adapters)
@@ -881,11 +891,11 @@ namespace NetworkCorner
             string validation = RequestValidator.Validate(request);
             if (validation != null)
             {
-                MessageBox.Show(validation, "Check network settings", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show(this, validation, "Check network settings", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
             string action = dhcp ? "switch " + request.Adapter + " to DHCP" : "apply these static settings to " + request.Adapter;
-            if (MessageBox.Show("This will " + action + ". Connectivity may briefly drop. Continue?", "Confirm network change", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+            if (MessageBox.Show(this, "This will " + action + ". Connectivity may briefly drop. Continue?", "Confirm network change", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
 
             string tempPath = Path.Combine(Path.GetTempPath(), "NetworkCorner-" + Guid.NewGuid().ToString("N") + ".json");
             try
@@ -899,11 +909,11 @@ namespace NetworkCorner
             }
             catch (System.ComponentModel.Win32Exception ex)
             {
-                if (ex.NativeErrorCode != 1223) MessageBox.Show(ex.Message, "Could not start network change", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                if (ex.NativeErrorCode != 1223) MessageBox.Show(this, ex.Message, "Could not start network change", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             catch (Exception ex)
             {
-                MessageBox.Show(ex.Message, "Could not start network change", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show(this, ex.Message, "Could not start network change", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             finally
             {
@@ -932,7 +942,7 @@ namespace NetworkCorner
 
         private void SaveProfile()
         {
-            string name = Prompt.Show("Profile name", "Save network profile");
+            string name = Prompt.Show(this, "Profile name", "Save network profile");
             if (String.IsNullOrWhiteSpace(name)) return;
             NetworkProfile p = profiles.FirstOrDefault(x => String.Equals(x.Name, name.Trim(), StringComparison.OrdinalIgnoreCase));
             if (p == null) { p = new NetworkProfile(); profiles.Add(p); }
@@ -946,7 +956,7 @@ namespace NetworkCorner
         {
             if (profileBox.SelectedItem == null) return;
             string name = profileBox.SelectedItem.ToString();
-            if (MessageBox.Show("Delete profile ‘" + name + "’?", "Delete profile", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+            if (MessageBox.Show(this, "Delete profile ‘" + name + "’?", "Delete profile", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
             profiles.RemoveAll(x => String.Equals(x.Name, name, StringComparison.OrdinalIgnoreCase));
             SaveProfiles();
             ReloadProfileBox();
@@ -994,20 +1004,20 @@ namespace NetworkCorner
 
     internal static class Prompt
     {
-        public static string Show(string label, string title)
+        public static string Show(IWin32Window owner, string label, string title)
         {
             using (var form = new Form())
             using (var input = new TextBox())
             using (var ok = new Button())
             using (var cancel = new Button())
             {
-                form.Text = title; form.ClientSize = new Size(330, 112); form.FormBorderStyle = FormBorderStyle.FixedDialog; form.StartPosition = FormStartPosition.CenterParent; form.MinimizeBox = false; form.MaximizeBox = false;
+                form.Text = title; form.ClientSize = new Size(330, 112); form.FormBorderStyle = FormBorderStyle.FixedDialog; form.StartPosition = FormStartPosition.CenterParent; form.MinimizeBox = false; form.MaximizeBox = false; form.ShowInTaskbar = false;
                 var prompt = new Label { Text = label, Left = 12, Top = 12, Width = 300 };
                 input.Left = 12; input.Top = 35; input.Width = 306;
                 ok.Text = "Save"; ok.Left = 162; ok.Top = 72; ok.Width = 75; ok.DialogResult = DialogResult.OK;
                 cancel.Text = "Cancel"; cancel.Left = 243; cancel.Top = 72; cancel.Width = 75; cancel.DialogResult = DialogResult.Cancel;
                 form.Controls.AddRange(new Control[] { prompt, input, ok, cancel }); form.AcceptButton = ok; form.CancelButton = cancel;
-                return form.ShowDialog() == DialogResult.OK ? input.Text : null;
+                return form.ShowDialog(owner) == DialogResult.OK ? input.Text : null;
             }
         }
     }

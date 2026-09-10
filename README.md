@@ -6,7 +6,7 @@ Network Corner is a compact, always-on-top Windows utility for router and networ
 
 Double-click `NetworkCorner.exe`. Choose the monitor and corner from the bottom of the panel. Enable **Stretch panel to full monitor height** when you want the utility to occupy the full vertical edge of that monitor; disable it to return to the compact panel.
 
-Each adapter heading shows both its connection status and how Windows assigns its IPv4 address, for example `[Connected • DHCP]` or `[Connected • Static]`.
+Each adapter heading shows both its connection status and how Windows assigns its IPv4 address, for example `[Connected • Dynamic / DHCP]` or `[Connected • Static]`. Wi-Fi, Ethernet, DHCP, and static states use distinct colours for quick recognition.
 
 The adapter-information area grows with the window. Drag the top or bottom window edge to give it more room, or enable full-height mode to use all remaining vertical space for adapter details.
 

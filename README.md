@@ -8,7 +8,7 @@ Double-click `NetworkCorner.exe`. Choose the monitor and corner from the bottom 
 
 Each adapter heading shows both its connection status and how Windows assigns its IPv4 address, for example `[Connected • Dynamic / DHCP]` or `[Connected • Static]`. Wi-Fi, Ethernet, DHCP, and static states use distinct colours for quick recognition.
 
-Enable **Hide down adapters** to remove disconnected adapters from the information panel, adapter editor, and Nmap network selector. Disable it to show every detected Wi-Fi and Ethernet adapter again.
+**Hide down adapters** is enabled by default, removing disconnected adapters from the information panel, adapter editor, and Nmap network selector. Disable it to show every detected Wi-Fi and Ethernet adapter again.
 
 The adapter-information area grows with the window. Drag the top or bottom window edge to give it more room, or enable full-height mode to use all remaining vertical space for adapter details.
 
@@ -27,6 +27,10 @@ Open the **Nmap Scan** tab and choose a detected Wi-Fi or Ethernet subnet from *
 
 Open the **Ping** tab to test a hostname or IP address. With **Continuous ping** disabled, Network Corner sends four pings and stops. Enable the checkbox to keep pinging until **Stop** is pressed. Output streams into the panel as it arrives, and **Use gateway** copies the selected adapter's gateway into the target field.
 
+## Telnet and SSH
+
+Open the **Telnet / SSH** tab, choose a protocol, enter the host and port, and optionally provide an SSH username. **Open connection** launches the installed Windows client in a separate interactive terminal. **Use gateway** copies the selected adapter's gateway into the host field. Network Corner never collects or stores terminal passwords.
+
 To change settings:
 
 1. Choose the Wi-Fi or Ethernet adapter under **Edit**.
@@ -36,6 +40,8 @@ To change settings:
 Click **Use DHCP** to return the selected adapter's address and DNS configuration to automatic assignment.
 
 Profiles store commonly used lab configurations. Fill in the fields, click **Save current**, and give the configuration a name. Selecting that profile later fills all fields; click **Apply static** to activate it.
+
+The built-in **TFTP** profile uses IP `192.168.1.10`, subnet mask `255.255.255.0`, gateway `192.168.1.1`, primary DNS `8.8.8.8`, and secondary DNS `8.8.4.4`.
 
 ## Safety behavior
 

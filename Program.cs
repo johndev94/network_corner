@@ -365,6 +365,36 @@ namespace NetworkCorner
         }
     }
 
+    internal static class ConnectionSupport
+    {
+        public static string ValidateHost(string host)
+        {
+            string validation = PingSupport.ValidateTarget(host);
+            return validation == null ? null : validation.Replace("ping target", "host").Replace("Ping target", "Host");
+        }
+
+        public static string ValidateUsername(string username)
+        {
+            if (String.IsNullOrWhiteSpace(username)) return null;
+            foreach (char c in username.Trim())
+            {
+                if (!(Char.IsLetterOrDigit(c) || c == '.' || c == '-' || c == '_'))
+                    return "The SSH username contains unsupported characters.";
+            }
+            return null;
+        }
+
+        public static string BuildClientArguments(bool ssh, string host, int port, string username)
+        {
+            if (ssh)
+            {
+                string destination = String.IsNullOrWhiteSpace(username) ? host.Trim() : username.Trim() + "@" + host.Trim();
+                return "-p " + port + " " + destination;
+            }
+            return host.Trim() + " " + port;
+        }
+    }
+
     internal sealed class MainForm : Form
     {
         private readonly Color Back = Color.FromArgb(20, 25, 32);
@@ -398,6 +428,11 @@ namespace NetworkCorner
         private readonly Label pingStatusLabel = new Label();
         private Button pingStartButton;
         private Button pingStopButton;
+        private readonly ComboBox connectionProtocolBox = new ComboBox();
+        private readonly TextBox connectionHostBox = new TextBox();
+        private readonly TextBox connectionUsernameBox = new TextBox();
+        private readonly NumericUpDown connectionPortBox = new NumericUpDown();
+        private readonly Label connectionStatusLabel = new Label();
         private readonly Label updatedLabel = new Label();
         private readonly Timer refreshTimer = new Timer();
         private List<AdapterInfo> adapters = new List<AdapterInfo>();
@@ -445,9 +480,11 @@ namespace NetworkCorner
             var networkTab = new TabPage("Network") { BackColor = Back, ForeColor = Color.White };
             var scanTab = new TabPage("Nmap Scan") { BackColor = Back, ForeColor = Color.White };
             var pingTab = new TabPage("Ping") { BackColor = Back, ForeColor = Color.White };
+            var connectionTab = new TabPage("Telnet / SSH") { BackColor = Back, ForeColor = Color.White };
             tabs.TabPages.Add(networkTab);
             tabs.TabPages.Add(scanTab);
             tabs.TabPages.Add(pingTab);
+            tabs.TabPages.Add(connectionTab);
             Controls.Add(tabs);
 
             var root = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(14), ColumnCount = 1, RowCount = 5, BackColor = Back };
@@ -470,6 +507,7 @@ namespace NetworkCorner
             hideDownCheck.Dock = DockStyle.Right;
             hideDownCheck.ForeColor = Color.FromArgb(220, 228, 238);
             hideDownCheck.TextAlign = ContentAlignment.MiddleLeft;
+            hideDownCheck.Checked = true;
             hideDownCheck.CheckedChanged += delegate { RefreshAdapters(true); };
             titlePanel.Controls.Add(title);
             titlePanel.Controls.Add(updatedLabel);
@@ -550,6 +588,7 @@ namespace NetworkCorner
 
             BuildScanTab(scanTab);
             BuildPingTab(pingTab);
+            BuildConnectionTab(connectionTab);
         }
 
         private void BuildScanTab(TabPage scanTab)
@@ -710,6 +749,144 @@ namespace NetworkCorner
             pingOutputBox.Text = "Enter a hostname or IP address. Enable Continuous ping to run until you press Stop.";
             outputPanel.Controls.Add(pingOutputBox);
             layout.Controls.Add(outputPanel, 0, 4);
+        }
+
+        private void BuildConnectionTab(TabPage connectionTab)
+        {
+            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(14), ColumnCount = 1, RowCount = 7, BackColor = Back };
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
+            for (int i = 1; i <= 4; i++) layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 56));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 55));
+            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            connectionTab.Controls.Add(layout);
+
+            var heading = new Panel { Dock = DockStyle.Fill };
+            heading.Controls.Add(new Label { Text = "TELNET / SSH", Font = new Font("Segoe UI Semibold", 14F), AutoSize = true, Location = new Point(0, 2), ForeColor = Color.White });
+            connectionStatusLabel.Text = "Ready • Windows clients detected";
+            connectionStatusLabel.AutoSize = true;
+            connectionStatusLabel.Location = new Point(2, 31);
+            connectionStatusLabel.ForeColor = Muted;
+            heading.Controls.Add(connectionStatusLabel);
+            layout.Controls.Add(heading, 0, 0);
+
+            var protocolRow = ConnectionRow("PROTOCOL");
+            StyleCombo(connectionProtocolBox);
+            connectionProtocolBox.Dock = DockStyle.Fill;
+            connectionProtocolBox.Items.AddRange(new object[] { "SSH", "Telnet" });
+            connectionProtocolBox.SelectedIndexChanged += delegate
+            {
+                bool ssh = connectionProtocolBox.SelectedIndex == 0;
+                connectionPortBox.Value = ssh ? 22 : 23;
+                connectionUsernameBox.Enabled = ssh;
+                connectionUsernameBox.BackColor = ssh ? Color.FromArgb(42, 50, 62) : Color.FromArgb(31, 37, 46);
+            };
+            protocolRow.Controls.Add(connectionProtocolBox, 1, 0);
+            layout.Controls.Add(protocolRow, 0, 1);
+
+            var hostRow = ConnectionRow("HOST");
+            StyleConnectionTextBox(connectionHostBox);
+            hostRow.Controls.Add(connectionHostBox, 1, 0);
+            layout.Controls.Add(hostRow, 0, 2);
+
+            var portRow = ConnectionRow("PORT");
+            connectionPortBox.Dock = DockStyle.Fill;
+            connectionPortBox.Minimum = 1;
+            connectionPortBox.Maximum = 65535;
+            connectionPortBox.Value = 22;
+            connectionPortBox.BackColor = Color.FromArgb(42, 50, 62);
+            connectionPortBox.ForeColor = Color.White;
+            connectionPortBox.BorderStyle = BorderStyle.FixedSingle;
+            portRow.Controls.Add(connectionPortBox, 1, 0);
+            layout.Controls.Add(portRow, 0, 3);
+
+            var usernameRow = ConnectionRow("USERNAME");
+            StyleConnectionTextBox(connectionUsernameBox);
+            usernameRow.Controls.Add(connectionUsernameBox, 1, 0);
+            layout.Controls.Add(usernameRow, 0, 4);
+
+            var buttons = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, BackColor = Back, Padding = new Padding(0, 7, 0, 7) };
+            buttons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 58));
+            buttons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 42));
+            buttons.Controls.Add(MakeButton("Open connection", delegate { OpenConnection(); }, true, 0), 0, 0);
+            buttons.Controls.Add(MakeButton("Use gateway", delegate { UseGatewayForConnection(); }, false, 0), 1, 0);
+            layout.Controls.Add(buttons, 0, 5);
+
+            var notePanel = Card();
+            var note = new Label
+            {
+                Dock = DockStyle.Fill,
+                ForeColor = Color.FromArgb(214, 225, 235),
+                Font = new Font("Segoe UI", 10F),
+                TextAlign = ContentAlignment.TopLeft,
+                Text = "The selected client opens in a separate interactive terminal.\r\n\r\nSSH uses the Windows OpenSSH client. Telnet uses the Windows Telnet client. Passwords and authentication prompts are handled only by that terminal and are never stored by Network Corner."
+            };
+            notePanel.Controls.Add(note);
+            layout.Controls.Add(notePanel, 0, 6);
+            connectionProtocolBox.SelectedIndex = 0;
+        }
+
+        private TableLayoutPanel ConnectionRow(string label)
+        {
+            var row = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, BackColor = Back, Padding = new Padding(0, 6, 0, 6) };
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 92));
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            row.Controls.Add(FieldLabel(label), 0, 0);
+            return row;
+        }
+
+        private void StyleConnectionTextBox(TextBox box)
+        {
+            box.Dock = DockStyle.Fill;
+            box.BorderStyle = BorderStyle.FixedSingle;
+            box.BackColor = Color.FromArgb(42, 50, 62);
+            box.ForeColor = Color.White;
+        }
+
+        private void OpenConnection()
+        {
+            string host = connectionHostBox.Text.Trim();
+            string validation = ConnectionSupport.ValidateHost(host);
+            if (validation == null && connectionProtocolBox.SelectedIndex == 0)
+                validation = ConnectionSupport.ValidateUsername(connectionUsernameBox.Text);
+            if (validation != null)
+            {
+                MessageBox.Show(this, validation, "Check connection settings", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            bool ssh = connectionProtocolBox.SelectedIndex == 0;
+            int port = Decimal.ToInt32(connectionPortBox.Value);
+            string systemFolder = Environment.GetFolderPath(Environment.SpecialFolder.System);
+            string executable = ssh ? Path.Combine(systemFolder, "OpenSSH", "ssh.exe") : Path.Combine(systemFolder, "telnet.exe");
+            if (!File.Exists(executable))
+            {
+                MessageBox.Show(this, (ssh ? "OpenSSH" : "Telnet") + " is not installed on this computer.", "Client unavailable", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            try
+            {
+                var start = new ProcessStartInfo(executable, ConnectionSupport.BuildClientArguments(ssh, host, port, connectionUsernameBox.Text));
+                start.UseShellExecute = true;
+                Process.Start(start);
+                connectionStatusLabel.Text = (ssh ? "SSH" : "Telnet") + " client opened for " + host + ":" + port;
+                connectionStatusLabel.ForeColor = Color.FromArgb(92, 214, 147);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, ex.Message, "Could not open connection", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void UseGatewayForConnection()
+        {
+            AdapterInfo selected = adapterBox.SelectedItem as AdapterInfo;
+            if (selected == null || String.IsNullOrWhiteSpace(selected.Gateway))
+            {
+                MessageBox.Show(this, "The selected adapter does not currently report an IPv4 gateway.", "Gateway unavailable", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            connectionHostBox.Text = selected.Gateway;
         }
 
         private void StartPing()
@@ -1074,6 +1251,7 @@ namespace NetworkCorner
             dns1Box.Text = a.Dns1;
             dns2Box.Text = a.Dns2;
             if (String.IsNullOrWhiteSpace(pingTargetBox.Text) && !String.IsNullOrWhiteSpace(a.Gateway)) pingTargetBox.Text = a.Gateway;
+            if (String.IsNullOrWhiteSpace(connectionHostBox.Text) && !String.IsNullOrWhiteSpace(a.Gateway)) connectionHostBox.Text = a.Gateway;
             profileBox.SelectedIndex = -1;
         }
 
@@ -1135,6 +1313,19 @@ namespace NetworkCorner
                 if (File.Exists(profilePath)) profiles = new JavaScriptSerializer().Deserialize<List<NetworkProfile>>(File.ReadAllText(profilePath, Encoding.UTF8)) ?? new List<NetworkProfile>();
             }
             catch { profiles = new List<NetworkProfile>(); }
+            if (!profiles.Any(x => String.Equals(x.Name, "TFTP", StringComparison.OrdinalIgnoreCase)))
+            {
+                profiles.Add(new NetworkProfile
+                {
+                    Name = "TFTP",
+                    Address = "192.168.1.10",
+                    Mask = "255.255.255.0",
+                    Gateway = "192.168.1.1",
+                    Dns1 = "8.8.8.8",
+                    Dns2 = "8.8.4.4"
+                });
+                SaveProfiles();
+            }
             ReloadProfileBox();
         }
 
@@ -1249,6 +1440,11 @@ namespace NetworkCorner
             failures += Check(PingSupport.ValidateTarget("router.local") == null, "valid ping hostname");
             failures += Check(PingSupport.ValidateTarget("192.168.1.0/24") != null, "reject ping network range");
             failures += Check(PingSupport.ArgumentsFor("192.168.1.1", true) == "-t 192.168.1.1", "continuous ping arguments");
+            failures += Check(ConnectionSupport.ValidateHost("router.local") == null, "valid SSH host");
+            failures += Check(ConnectionSupport.ValidateUsername("lab-admin") == null, "valid SSH username");
+            failures += Check(ConnectionSupport.ValidateUsername("name & command") != null, "reject SSH username injection");
+            failures += Check(ConnectionSupport.BuildClientArguments(true, "192.168.1.1", 2222, "admin") == "-p 2222 admin@192.168.1.1", "SSH client arguments");
+            failures += Check(ConnectionSupport.BuildClientArguments(false, "192.168.1.1", 23, "") == "192.168.1.1 23", "Telnet client arguments");
             Console.WriteLine(failures == 0 ? "All self-tests passed." : failures + " self-test(s) failed.");
             return failures == 0 ? 0 : 1;
         }

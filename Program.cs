@@ -343,6 +343,28 @@ namespace NetworkCorner
         }
     }
 
+    internal static class PingSupport
+    {
+        public static string ValidateTarget(string target)
+        {
+            if (String.IsNullOrWhiteSpace(target)) return "Enter a ping target.";
+            target = target.Trim();
+            if (target.Length > 255) return "The ping target is too long.";
+            if (target.StartsWith("-") || target.Contains("/")) return "Enter one hostname or IP address, not a network range.";
+            foreach (char c in target)
+            {
+                if (!(Char.IsLetterOrDigit(c) || c == '.' || c == '-' || c == '_' || c == ':' || c == '%'))
+                    return "Use a hostname or IP address without spaces.";
+            }
+            return null;
+        }
+
+        public static string ArgumentsFor(string target, bool continuous)
+        {
+            return (continuous ? "-t " : "-n 4 ") + target.Trim();
+        }
+    }
+
     internal sealed class MainForm : Form
     {
         private readonly Color Back = Color.FromArgb(20, 25, 32);
@@ -370,6 +392,12 @@ namespace NetworkCorner
         private readonly Label scanStatusLabel = new Label();
         private Button scanStartButton;
         private Button scanCancelButton;
+        private readonly TextBox pingTargetBox = new TextBox();
+        private readonly CheckBox continuousPingCheck = new CheckBox();
+        private readonly RichTextBox pingOutputBox = new RichTextBox();
+        private readonly Label pingStatusLabel = new Label();
+        private Button pingStartButton;
+        private Button pingStopButton;
         private readonly Label updatedLabel = new Label();
         private readonly Timer refreshTimer = new Timer();
         private List<AdapterInfo> adapters = new List<AdapterInfo>();
@@ -377,6 +405,7 @@ namespace NetworkCorner
         private bool loading;
         private int normalHeight;
         private Process currentScan;
+        private Process currentPing;
         private readonly string profilePath;
 
         public MainForm()
@@ -404,6 +433,7 @@ namespace NetworkCorner
             FormClosed += delegate
             {
                 if (currentScan != null && !currentScan.HasExited) currentScan.Kill();
+                if (currentPing != null && !currentPing.HasExited) currentPing.Kill();
                 summaryRegularFont.Dispose();
                 summaryBoldFont.Dispose();
             };
@@ -414,8 +444,10 @@ namespace NetworkCorner
             var tabs = new TabControl { Dock = DockStyle.Fill, Appearance = TabAppearance.Normal };
             var networkTab = new TabPage("Network") { BackColor = Back, ForeColor = Color.White };
             var scanTab = new TabPage("Nmap Scan") { BackColor = Back, ForeColor = Color.White };
+            var pingTab = new TabPage("Ping") { BackColor = Back, ForeColor = Color.White };
             tabs.TabPages.Add(networkTab);
             tabs.TabPages.Add(scanTab);
+            tabs.TabPages.Add(pingTab);
             Controls.Add(tabs);
 
             var root = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(14), ColumnCount = 1, RowCount = 5, BackColor = Back };
@@ -517,6 +549,7 @@ namespace NetworkCorner
             root.Controls.Add(actions, 0, 4);
 
             BuildScanTab(scanTab);
+            BuildPingTab(pingTab);
         }
 
         private void BuildScanTab(TabPage scanTab)
@@ -614,6 +647,179 @@ namespace NetworkCorner
             scanOutputBox.Text = "Enter a hostname, IPv4 address, or CIDR range, then choose a scan type.\r\nOnly scan networks and devices you are authorised to test.";
             outputPanel.Controls.Add(scanOutputBox);
             layout.Controls.Add(outputPanel, 0, 5);
+        }
+
+        private void BuildPingTab(TabPage pingTab)
+        {
+            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(14), ColumnCount = 1, RowCount = 5, BackColor = Back };
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 56));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 55));
+            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            pingTab.Controls.Add(layout);
+
+            var heading = new Panel { Dock = DockStyle.Fill };
+            heading.Controls.Add(new Label { Text = "PING MONITOR", Font = new Font("Segoe UI Semibold", 14F), AutoSize = true, Location = new Point(0, 2), ForeColor = Color.White });
+            pingStatusLabel.Text = "Ready";
+            pingStatusLabel.AutoSize = true;
+            pingStatusLabel.Location = new Point(2, 31);
+            pingStatusLabel.ForeColor = Muted;
+            heading.Controls.Add(pingStatusLabel);
+            layout.Controls.Add(heading, 0, 0);
+
+            var targetRow = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, BackColor = Back, Padding = new Padding(0, 6, 0, 6) };
+            targetRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 92));
+            targetRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            targetRow.Controls.Add(FieldLabel("TARGET"), 0, 0);
+            pingTargetBox.Dock = DockStyle.Fill;
+            pingTargetBox.BorderStyle = BorderStyle.FixedSingle;
+            pingTargetBox.BackColor = Color.FromArgb(42, 50, 62);
+            pingTargetBox.ForeColor = Color.White;
+            targetRow.Controls.Add(pingTargetBox, 1, 0);
+            layout.Controls.Add(targetRow, 0, 1);
+
+            continuousPingCheck.Text = "Continuous ping (runs until stopped)";
+            continuousPingCheck.Dock = DockStyle.Fill;
+            continuousPingCheck.ForeColor = Color.White;
+            continuousPingCheck.Padding = new Padding(92, 0, 0, 0);
+            layout.Controls.Add(continuousPingCheck, 0, 2);
+
+            var buttons = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, BackColor = Back, Padding = new Padding(0, 7, 0, 7) };
+            buttons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 40));
+            buttons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 28));
+            buttons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 32));
+            pingStartButton = MakeButton("Start ping", delegate { StartPing(); }, true, 0);
+            pingStopButton = MakeButton("Stop", delegate { StopPing(); }, false, 0);
+            pingStopButton.Enabled = false;
+            buttons.Controls.Add(pingStartButton, 0, 0);
+            buttons.Controls.Add(pingStopButton, 1, 0);
+            buttons.Controls.Add(MakeButton("Use gateway", delegate { UseGatewayForPing(); }, false, 0), 2, 0);
+            layout.Controls.Add(buttons, 0, 3);
+
+            var outputPanel = Card();
+            pingOutputBox.Dock = DockStyle.Fill;
+            pingOutputBox.ReadOnly = true;
+            pingOutputBox.BackColor = Color.FromArgb(15, 20, 26);
+            pingOutputBox.ForeColor = Color.FromArgb(214, 225, 235);
+            pingOutputBox.BorderStyle = BorderStyle.None;
+            pingOutputBox.Font = summaryRegularFont;
+            pingOutputBox.WordWrap = false;
+            pingOutputBox.ScrollBars = RichTextBoxScrollBars.Both;
+            pingOutputBox.DetectUrls = false;
+            pingOutputBox.Text = "Enter a hostname or IP address. Enable Continuous ping to run until you press Stop.";
+            outputPanel.Controls.Add(pingOutputBox);
+            layout.Controls.Add(outputPanel, 0, 4);
+        }
+
+        private void StartPing()
+        {
+            if (currentPing != null && !currentPing.HasExited) return;
+            string target = pingTargetBox.Text.Trim();
+            string validation = PingSupport.ValidateTarget(target);
+            if (validation != null)
+            {
+                MessageBox.Show(this, validation, "Check ping target", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            bool continuous = continuousPingCheck.Checked;
+            pingOutputBox.Clear();
+            AppendPingOutput("Pinging " + target + (continuous ? " continuously" : " four times") + "…\r\n\r\n", Accent);
+            var process = new Process();
+            process.StartInfo = new ProcessStartInfo("ping.exe", PingSupport.ArgumentsFor(target, continuous));
+            process.StartInfo.UseShellExecute = false;
+            process.StartInfo.CreateNoWindow = true;
+            process.StartInfo.RedirectStandardOutput = true;
+            process.StartInfo.RedirectStandardError = true;
+            process.EnableRaisingEvents = true;
+            process.OutputDataReceived += delegate(object sender, DataReceivedEventArgs e) { if (e.Data != null) AppendPingOutputSafe(e.Data + "\r\n", Color.FromArgb(214, 225, 235)); };
+            process.ErrorDataReceived += delegate(object sender, DataReceivedEventArgs e) { if (e.Data != null) AppendPingOutputSafe(e.Data + "\r\n", Color.FromArgb(255, 130, 130)); };
+            process.Exited += delegate(object sender, EventArgs e)
+            {
+                int exitCode = process.ExitCode;
+                try
+                {
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        pingStatusLabel.Text = exitCode == 0 ? "Ping complete" : "Ping stopped • exit code " + exitCode;
+                        pingStatusLabel.ForeColor = exitCode == 0 ? Color.FromArgb(92, 214, 147) : Color.FromArgb(255, 190, 83);
+                        pingStartButton.Enabled = true;
+                        pingStopButton.Enabled = false;
+                        pingTargetBox.Enabled = true;
+                        continuousPingCheck.Enabled = true;
+                        AppendPingOutput("\r\n" + pingStatusLabel.Text + ".\r\n", pingStatusLabel.ForeColor);
+                        currentPing = null;
+                        process.Dispose();
+                    });
+                }
+                catch { process.Dispose(); }
+            };
+
+            try
+            {
+                currentPing = process;
+                process.Start();
+                process.BeginOutputReadLine();
+                process.BeginErrorReadLine();
+                pingStatusLabel.Text = continuous ? "Continuous ping running…" : "Pinging " + target + "…";
+                pingStatusLabel.ForeColor = Color.FromArgb(74, 193, 255);
+                pingStartButton.Enabled = false;
+                pingStopButton.Enabled = true;
+                pingTargetBox.Enabled = false;
+                continuousPingCheck.Enabled = false;
+            }
+            catch (Exception ex)
+            {
+                currentPing = null;
+                process.Dispose();
+                pingStartButton.Enabled = true;
+                pingStopButton.Enabled = false;
+                MessageBox.Show(this, ex.Message, "Could not start ping", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void StopPing()
+        {
+            try
+            {
+                if (currentPing != null && !currentPing.HasExited)
+                {
+                    pingStatusLabel.Text = "Stopping ping…";
+                    currentPing.Kill();
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, ex.Message, "Could not stop ping", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void UseGatewayForPing()
+        {
+            AdapterInfo selected = adapterBox.SelectedItem as AdapterInfo;
+            if (selected == null || String.IsNullOrWhiteSpace(selected.Gateway))
+            {
+                MessageBox.Show(this, "The selected adapter does not currently report an IPv4 gateway.", "Gateway unavailable", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            pingTargetBox.Text = selected.Gateway;
+        }
+
+        private void AppendPingOutputSafe(string text, Color color)
+        {
+            try { BeginInvoke((MethodInvoker)delegate { AppendPingOutput(text, color); }); }
+            catch { }
+        }
+
+        private void AppendPingOutput(string text, Color color)
+        {
+            pingOutputBox.SelectionStart = pingOutputBox.TextLength;
+            pingOutputBox.SelectionLength = 0;
+            pingOutputBox.SelectionColor = color;
+            pingOutputBox.AppendText(text);
+            pingOutputBox.SelectionStart = pingOutputBox.TextLength;
+            pingOutputBox.ScrollToCaret();
         }
 
         private void StartScan()
@@ -867,6 +1073,7 @@ namespace NetworkCorner
             gatewayBox.Text = a.Gateway;
             dns1Box.Text = a.Dns1;
             dns2Box.Text = a.Dns2;
+            if (String.IsNullOrWhiteSpace(pingTargetBox.Text) && !String.IsNullOrWhiteSpace(a.Gateway)) pingTargetBox.Text = a.Gateway;
             profileBox.SelectedIndex = -1;
         }
 
@@ -1039,6 +1246,9 @@ namespace NetworkCorner
             failures += Check(NmapSupport.ArgumentsFor(1, "router.local").Contains("--top-ports 100"), "Nmap quick scan preset");
             failures += Check(NmapSupport.NetworkTarget("192.168.8.42", "255.255.255.0") == "192.168.8.0/24", "derive Nmap network target");
             failures += Check(NmapSupport.NetworkTarget("10.20.31.4", "255.255.240.0") == "10.20.16.0/20", "derive non-/24 network target");
+            failures += Check(PingSupport.ValidateTarget("router.local") == null, "valid ping hostname");
+            failures += Check(PingSupport.ValidateTarget("192.168.1.0/24") != null, "reject ping network range");
+            failures += Check(PingSupport.ArgumentsFor("192.168.1.1", true) == "-t 192.168.1.1", "continuous ping arguments");
             Console.WriteLine(failures == 0 ? "All self-tests passed." : failures + " self-test(s) failed.");
             return failures == 0 ? 0 : 1;
         }

@@ -23,6 +23,10 @@ Open the **Nmap Scan** tab and choose a detected Wi-Fi or Ethernet subnet from *
 
 **Use gateway** copies the selected network adapter's current gateway into the scan target. Scan results stream into the output panel and an active scan can be cancelled. Only scan networks and devices you are authorised to test.
 
+## Ping monitor
+
+Open the **Ping** tab to test a hostname or IP address. With **Continuous ping** disabled, Network Corner sends four pings and stops. Enable the checkbox to keep pinging until **Stop** is pressed. Output streams into the panel as it arrives, and **Use gateway** copies the selected adapter's gateway into the target field.
+
 To change settings:
 
 1. Choose the Wi-Fi or Ethernet adapter under **Edit**.

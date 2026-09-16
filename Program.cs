@@ -6,9 +6,11 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.Reflection;
 using System.Security.Principal;
 using System.Text;
+using System.Threading;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
 using Microsoft.Win32;
@@ -48,9 +50,21 @@ namespace NetworkCorner
         public string Dns2 { get; set; }
     }
 
+    internal sealed class AppPreferences
+    {
+        public int MonitorIndex { get; set; }
+        public int CornerIndex { get; set; }
+        public bool FullHeight { get; set; }
+        public bool HideDownAdapters { get; set; }
+        public int SelectedTabIndex { get; set; }
+        public int WindowWidth { get; set; }
+        public int WindowHeight { get; set; }
+    }
+
     internal sealed class ChangeRequest
     {
         public string Adapter { get; set; }
+        public string Operation { get; set; }
         public bool Dhcp { get; set; }
         public string Address { get; set; }
         public string Mask { get; set; }
@@ -61,6 +75,7 @@ namespace NetworkCorner
 
     internal sealed class AdapterInfo
     {
+        public string Id;
         public string Name;
         public string Kind;
         public string Status;
@@ -78,6 +93,7 @@ namespace NetworkCorner
     {
         public string Label;
         public string Target;
+        public bool IsManual;
         public override string ToString() { return Label; }
     }
 
@@ -90,6 +106,7 @@ namespace NetworkCorner
             {
                 if (!IsUseful(nic)) continue;
                 var item = new AdapterInfo();
+                item.Id = nic.Id;
                 item.Name = nic.Name;
                 item.Kind = FriendlyKind(nic.NetworkInterfaceType);
                 item.Status = nic.OperationalStatus == OperationalStatus.Up ? "Connected" : nic.OperationalStatus.ToString();
@@ -152,9 +169,15 @@ namespace NetworkCorner
         public static string Validate(ChangeRequest request)
         {
             if (request == null) return "The change request is missing.";
+            if (request.Operation == "flushdns") return null;
             if (String.IsNullOrWhiteSpace(request.Adapter)) return "Choose a network adapter.";
             if (request.Adapter.IndexOf('"') >= 0 || request.Adapter.IndexOf('\r') >= 0 || request.Adapter.IndexOf('\n') >= 0)
                 return "The adapter name contains unsupported characters.";
+            if (!String.IsNullOrWhiteSpace(request.Operation))
+            {
+                if (request.Operation == "release" || request.Operation == "renew") return null;
+                return "The requested IP operation is not supported.";
+            }
             if (request.Dhcp) return null;
             if (!IsIpv4(request.Address)) return "Enter a valid IPv4 address.";
             if (!IsValidMask(request.Mask)) return "Enter a valid contiguous subnet mask (for example 255.255.255.0).";
@@ -204,7 +227,11 @@ namespace NetworkCorner
                 string validation = RequestValidator.Validate(request);
                 if (validation != null) throw new InvalidOperationException(validation);
                 Apply(request);
-                MessageBox.Show(request.Dhcp ? "DHCP is now enabled." : "The static network settings were applied.", "Network Corner", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                string success = request.Operation == "release" ? "The adapter's DHCP lease was released." :
+                                 request.Operation == "renew" ? "The adapter's DHCP lease was renewed." :
+                                 request.Operation == "flushdns" ? "The Windows DNS resolver cache was flushed." :
+                                 request.Dhcp ? "DHCP is now enabled." : "The static network settings were applied.";
+                MessageBox.Show(success, "Network Corner", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return 0;
             }
             catch (Exception ex)
@@ -236,10 +263,40 @@ namespace NetworkCorner
             return commands;
         }
 
+        public static string BuildIpconfigArguments(ChangeRequest request)
+        {
+            if (request.Operation == "flushdns") return "/flushdns";
+            if (request.Operation != "release" && request.Operation != "renew")
+                throw new ArgumentException("Unsupported IP operation.");
+            return "/" + request.Operation + " " + Quote(request.Adapter);
+        }
+
         private static void Apply(ChangeRequest request)
         {
             if (!IsAdministrator()) throw new InvalidOperationException("Administrator permission is required to change network settings.");
+            if (!String.IsNullOrWhiteSpace(request.Operation))
+            {
+                RunIpconfig(BuildIpconfigArguments(request));
+                return;
+            }
             foreach (string command in BuildCommands(request)) RunNetsh(command);
+        }
+
+        private static void RunIpconfig(string arguments)
+        {
+            var psi = new ProcessStartInfo("ipconfig.exe", arguments);
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError = true;
+            using (Process process = Process.Start(psi))
+            {
+                string stdout = process.StandardOutput.ReadToEnd();
+                string stderr = process.StandardError.ReadToEnd();
+                process.WaitForExit();
+                if (process.ExitCode != 0)
+                    throw new InvalidOperationException("Windows rejected the IP operation.\r\n\r\n" + FirstNonEmpty(stderr, stdout));
+            }
         }
 
         private static void RunNetsh(string arguments)
@@ -306,7 +363,7 @@ namespace NetworkCorner
             return null;
         }
 
-        public static string ArgumentsFor(int presetIndex, string target)
+        public static string ArgumentsFor(int presetIndex, string target, string interfaceName = null)
         {
             string options;
             switch (presetIndex)
@@ -317,7 +374,43 @@ namespace NetworkCorner
                 case 3: options = "-sT -sV --top-ports 100 --reason -T4"; break;
                 default: throw new ArgumentOutOfRangeException("presetIndex");
             }
+            if (!String.IsNullOrWhiteSpace(interfaceName)) options += " -e " + interfaceName.Trim();
             return options + " " + target.Trim();
+        }
+
+        public static Dictionary<string, string> GetInterfaceMap(string executable)
+        {
+            var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (String.IsNullOrWhiteSpace(executable) || !File.Exists(executable)) return result;
+            var psi = new ProcessStartInfo(executable, "--iflist");
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError = true;
+            using (Process process = Process.Start(psi))
+            {
+                string output = process.StandardOutput.ReadToEnd();
+                process.WaitForExit();
+                return ParseInterfaceMap(output);
+            }
+        }
+
+        public static Dictionary<string, string> ParseInterfaceMap(string output)
+        {
+            var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string rawLine in (output ?? "").Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                int marker = rawLine.IndexOf(@"\Device\NPF_{", StringComparison.OrdinalIgnoreCase);
+                if (marker < 0) continue;
+                string[] parts = rawLine.Trim().Split((char[])null, StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length < 2) continue;
+                int open = rawLine.IndexOf('{', marker);
+                int close = rawLine.IndexOf('}', open + 1);
+                if (open < 0 || close < 0) continue;
+                string id = rawLine.Substring(open + 1, close - open - 1);
+                if (!result.ContainsKey(id)) result.Add(id, parts[0]);
+            }
+            return result;
         }
 
         public static string NetworkTarget(string address, string mask)
@@ -359,9 +452,11 @@ namespace NetworkCorner
             return null;
         }
 
-        public static string ArgumentsFor(string target, bool continuous)
+        public static string ArgumentsFor(string target, bool continuous, string sourceAddress = null)
         {
-            return (continuous ? "-t " : "-n 4 ") + target.Trim();
+            string arguments = continuous ? "-t" : "-n 4";
+            if (!String.IsNullOrWhiteSpace(sourceAddress)) arguments += " -S " + sourceAddress.Trim();
+            return arguments + " " + target.Trim();
         }
     }
 
@@ -384,12 +479,13 @@ namespace NetworkCorner
             return null;
         }
 
-        public static string BuildClientArguments(bool ssh, string host, int port, string username)
+        public static string BuildClientArguments(bool ssh, string host, int port, string username, string sourceAddress = null)
         {
             if (ssh)
             {
                 string destination = String.IsNullOrWhiteSpace(username) ? host.Trim() : username.Trim() + "@" + host.Trim();
-                return "-p " + port + " " + destination;
+                string bind = String.IsNullOrWhiteSpace(sourceAddress) ? "" : "-b " + sourceAddress.Trim() + " ";
+                return bind + "-p " + port + " " + destination;
             }
             return host.Trim() + " " + port;
         }
@@ -403,6 +499,7 @@ namespace NetworkCorner
         private readonly Color Accent = Color.FromArgb(51, 182, 161);
         private readonly Font summaryRegularFont = new Font("Consolas", 9F, FontStyle.Regular);
         private readonly Font summaryBoldFont = new Font("Consolas", 9F, FontStyle.Bold);
+        private readonly TabControl mainTabs = new TabControl();
         private readonly ComboBox adapterBox = new ComboBox();
         private readonly ComboBox profileBox = new ComboBox();
         private readonly ComboBox screenBox = new ComboBox();
@@ -416,6 +513,7 @@ namespace NetworkCorner
         private readonly TextBox dns2Box = new TextBox();
         private readonly RichTextBox summaryBox = new RichTextBox();
         private readonly TextBox scanTargetBox = new TextBox();
+        private readonly ComboBox scanAdapterBox = new ComboBox();
         private readonly ComboBox scanNetworkBox = new ComboBox();
         private readonly ComboBox scanPresetBox = new ComboBox();
         private readonly RichTextBox scanOutputBox = new RichTextBox();
@@ -423,29 +521,45 @@ namespace NetworkCorner
         private Button scanStartButton;
         private Button scanCancelButton;
         private readonly TextBox pingTargetBox = new TextBox();
+        private readonly ComboBox pingAdapterBox = new ComboBox();
+        private readonly ComboBox pingTargetModeBox = new ComboBox();
         private readonly CheckBox continuousPingCheck = new CheckBox();
         private readonly RichTextBox pingOutputBox = new RichTextBox();
         private readonly Label pingStatusLabel = new Label();
         private Button pingStartButton;
         private Button pingStopButton;
         private readonly ComboBox connectionProtocolBox = new ComboBox();
+        private readonly ComboBox connectionAdapterBox = new ComboBox();
+        private readonly ComboBox connectionTargetModeBox = new ComboBox();
         private readonly TextBox connectionHostBox = new TextBox();
         private readonly TextBox connectionUsernameBox = new TextBox();
         private readonly NumericUpDown connectionPortBox = new NumericUpDown();
         private readonly Label connectionStatusLabel = new Label();
+        private readonly TextBox diagnosticsTargetBox = new TextBox();
+        private readonly NumericUpDown diagnosticsPortBox = new NumericUpDown();
+        private readonly RichTextBox diagnosticsOutputBox = new RichTextBox();
+        private readonly Label diagnosticsStatusLabel = new Label();
+        private Button diagnosticsStopButton;
+        private Button releaseIpButton;
+        private Button renewIpButton;
         private readonly Label updatedLabel = new Label();
-        private readonly Timer refreshTimer = new Timer();
+        private readonly System.Windows.Forms.Timer refreshTimer = new System.Windows.Forms.Timer();
         private List<AdapterInfo> adapters = new List<AdapterInfo>();
         private List<NetworkProfile> profiles = new List<NetworkProfile>();
         private bool loading;
         private int normalHeight;
         private Process currentScan;
         private Process currentPing;
+        private Process currentDiagnostic;
+        private bool diagnosticBusy;
+        private Dictionary<string, string> nmapInterfaces = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         private readonly string profilePath;
+        private readonly string preferencesPath;
 
         public MainForm()
         {
             profilePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "NetworkCorner", "profiles.json");
+            preferencesPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "NetworkCorner", "settings.json");
             Text = "Network Corner";
             ClientSize = new Size(410, 780);
             MinimumSize = new Size(390, 650);
@@ -453,46 +567,55 @@ namespace NetworkCorner
             ForeColor = Color.White;
             Font = new Font("Segoe UI", 9F);
             TopMost = true;
-            FormBorderStyle = FormBorderStyle.SizableToolWindow;
+            FormBorderStyle = FormBorderStyle.Sizable;
+            MinimizeBox = true;
+            MaximizeBox = false;
             StartPosition = FormStartPosition.Manual;
             ShowInTaskbar = true;
 
             BuildUi();
             LoadProfiles();
             LoadScreens();
+            LoadPreferences();
             RefreshAdapters(true);
             refreshTimer.Interval = 5000;
             refreshTimer.Tick += delegate { RefreshAdapters(false); };
             refreshTimer.Start();
             Shown += delegate { normalHeight = Height; DockToCorner(); };
+            ResizeEnd += delegate { if (!fullHeightCheck.Checked) normalHeight = Height; };
             FormClosed += delegate
             {
                 if (currentScan != null && !currentScan.HasExited) currentScan.Kill();
                 if (currentPing != null && !currentPing.HasExited) currentPing.Kill();
+                if (currentDiagnostic != null && !currentDiagnostic.HasExited) currentDiagnostic.Kill();
                 summaryRegularFont.Dispose();
                 summaryBoldFont.Dispose();
             };
+            FormClosing += delegate { SavePreferences(); };
         }
 
         private void BuildUi()
         {
-            var tabs = new TabControl { Dock = DockStyle.Fill, Appearance = TabAppearance.Normal };
+            mainTabs.Dock = DockStyle.Fill;
+            mainTabs.Appearance = TabAppearance.Normal;
             var networkTab = new TabPage("Network") { BackColor = Back, ForeColor = Color.White };
             var scanTab = new TabPage("Nmap Scan") { BackColor = Back, ForeColor = Color.White };
             var pingTab = new TabPage("Ping") { BackColor = Back, ForeColor = Color.White };
             var connectionTab = new TabPage("Telnet / SSH") { BackColor = Back, ForeColor = Color.White };
-            tabs.TabPages.Add(networkTab);
-            tabs.TabPages.Add(scanTab);
-            tabs.TabPages.Add(pingTab);
-            tabs.TabPages.Add(connectionTab);
-            Controls.Add(tabs);
+            var diagnosticsTab = new TabPage("Diagnostics") { BackColor = Back, ForeColor = Color.White };
+            mainTabs.TabPages.Add(networkTab);
+            mainTabs.TabPages.Add(scanTab);
+            mainTabs.TabPages.Add(pingTab);
+            mainTabs.TabPages.Add(connectionTab);
+            mainTabs.TabPages.Add(diagnosticsTab);
+            Controls.Add(mainTabs);
 
             var root = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(14), ColumnCount = 1, RowCount = 5, BackColor = Back };
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 340));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 60));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 105));
             networkTab.Controls.Add(root);
 
             var titlePanel = new Panel { Dock = DockStyle.Fill };
@@ -508,7 +631,7 @@ namespace NetworkCorner
             hideDownCheck.ForeColor = Color.FromArgb(220, 228, 238);
             hideDownCheck.TextAlign = ContentAlignment.MiddleLeft;
             hideDownCheck.Checked = true;
-            hideDownCheck.CheckedChanged += delegate { RefreshAdapters(true); };
+            hideDownCheck.CheckedChanged += delegate { if (!loading) RefreshAdapters(true); };
             titlePanel.Controls.Add(title);
             titlePanel.Controls.Add(updatedLabel);
             titlePanel.Controls.Add(hideDownCheck);
@@ -562,8 +685,8 @@ namespace NetworkCorner
             StyleCombo(cornerBox); cornerBox.Width = 108;
             cornerBox.Items.AddRange(new object[] { "Top right", "Top left", "Bottom right", "Bottom left" });
             cornerBox.SelectedIndex = 0;
-            screenBox.SelectedIndexChanged += delegate { DockToCorner(); };
-            cornerBox.SelectedIndexChanged += delegate { DockToCorner(); };
+            screenBox.SelectedIndexChanged += delegate { if (!loading) DockToCorner(); };
+            cornerBox.SelectedIndexChanged += delegate { if (!loading) DockToCorner(); };
             location.Controls.Add(screenBox);
             location.Controls.Add(cornerBox);
             editor.Controls.Add(FieldLabel("POSITION"), 0, 7);
@@ -572,29 +695,37 @@ namespace NetworkCorner
             fullHeightCheck.Text = "Stretch panel to full monitor height";
             fullHeightCheck.Dock = DockStyle.Fill;
             fullHeightCheck.ForeColor = Color.White;
-            fullHeightCheck.CheckedChanged += delegate { DockToCorner(); };
+            fullHeightCheck.CheckedChanged += delegate { if (!loading) DockToCorner(); };
             editor.Controls.Add(FieldLabel("DISPLAY"), 0, 8);
             editor.Controls.Add(fullHeightCheck, 1, 8);
             root.Controls.Add(editor, 0, 3);
 
-            var actions = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, Padding = new Padding(0, 10, 0, 0), BackColor = Back };
-            actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 46));
-            actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 34));
-            actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 20));
+            var actions = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 2, Padding = new Padding(0, 8, 0, 0), BackColor = Back };
+            actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 38));
+            actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 31));
+            actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 31));
+            actions.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+            actions.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
             actions.Controls.Add(MakeButton("Apply static", delegate { Apply(false); }, true, 0), 0, 0);
             actions.Controls.Add(MakeButton("Use DHCP", delegate { Apply(true); }, false, 0), 1, 0);
-            actions.Controls.Add(MakeButton("↻", delegate { RefreshAdapters(true); }, false, 0), 2, 0);
+            actions.Controls.Add(MakeButton("Refresh IP", delegate { RefreshAdapters(true); }, false, 0), 2, 0);
+            releaseIpButton = MakeButton("Release IP", delegate { RunIpOperation("release"); }, false, 0);
+            renewIpButton = MakeButton("Renew IP", delegate { RunIpOperation("renew"); }, false, 0);
+            actions.Controls.Add(releaseIpButton, 0, 1);
+            actions.Controls.Add(renewIpButton, 1, 1);
             root.Controls.Add(actions, 0, 4);
 
             BuildScanTab(scanTab);
             BuildPingTab(pingTab);
             BuildConnectionTab(connectionTab);
+            BuildDiagnosticsTab(diagnosticsTab);
         }
 
         private void BuildScanTab(TabPage scanTab)
         {
-            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(14), ColumnCount = 1, RowCount = 6, BackColor = Back };
+            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(14), ColumnCount = 1, RowCount = 7, BackColor = Back };
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 56));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 56));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 56));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 56));
@@ -611,10 +742,20 @@ namespace NetworkCorner
             heading.Controls.Add(scanStatusLabel);
             layout.Controls.Add(heading, 0, 0);
 
+            var adapterRow = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, BackColor = Back, Padding = new Padding(0, 6, 0, 6) };
+            adapterRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 92));
+            adapterRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            adapterRow.Controls.Add(FieldLabel("ADAPTER"), 0, 0);
+            StyleCombo(scanAdapterBox);
+            scanAdapterBox.Dock = DockStyle.Fill;
+            scanAdapterBox.SelectedIndexChanged += delegate { if (!loading) PopulateScanNetworks(null, false, true); };
+            adapterRow.Controls.Add(scanAdapterBox, 1, 0);
+            layout.Controls.Add(adapterRow, 0, 1);
+
             var networkRow = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, BackColor = Back, Padding = new Padding(0, 6, 0, 6) };
             networkRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 92));
             networkRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            networkRow.Controls.Add(FieldLabel("NETWORK"), 0, 0);
+            networkRow.Controls.Add(FieldLabel("TARGET MODE"), 0, 0);
             StyleCombo(scanNetworkBox);
             scanNetworkBox.Dock = DockStyle.Fill;
             scanNetworkBox.SelectedIndexChanged += delegate
@@ -629,7 +770,7 @@ namespace NetworkCorner
                 }
             };
             networkRow.Controls.Add(scanNetworkBox, 1, 0);
-            layout.Controls.Add(networkRow, 0, 1);
+            layout.Controls.Add(networkRow, 0, 2);
 
             var targetRow = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, BackColor = Back, Padding = new Padding(0, 6, 0, 6) };
             targetRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 92));
@@ -645,10 +786,16 @@ namespace NetworkCorner
                 if (loading || scanNetworkBox.SelectedIndex < 0) return;
                 ScanNetworkOption option = scanNetworkBox.SelectedItem as ScanNetworkOption;
                 if (option != null && !String.IsNullOrWhiteSpace(option.Target) && !String.Equals(option.Target, scanTargetBox.Text.Trim(), StringComparison.OrdinalIgnoreCase))
-                    scanNetworkBox.SelectedIndex = 0;
+                {
+                    for (int i = 0; i < scanNetworkBox.Items.Count; i++)
+                    {
+                        ScanNetworkOption candidate = scanNetworkBox.Items[i] as ScanNetworkOption;
+                        if (candidate != null && candidate.IsManual) { scanNetworkBox.SelectedIndex = i; break; }
+                    }
+                }
             };
             targetRow.Controls.Add(scanTargetBox, 1, 0);
-            layout.Controls.Add(targetRow, 0, 2);
+            layout.Controls.Add(targetRow, 0, 3);
 
             var presetRow = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, BackColor = Back, Padding = new Padding(0, 6, 0, 6) };
             presetRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 92));
@@ -659,7 +806,7 @@ namespace NetworkCorner
             scanPresetBox.Items.AddRange(new object[] { "Discover devices", "Quick ports", "Standard ports", "Services + versions" });
             scanPresetBox.SelectedIndex = 0;
             presetRow.Controls.Add(scanPresetBox, 1, 0);
-            layout.Controls.Add(presetRow, 0, 3);
+            layout.Controls.Add(presetRow, 0, 4);
 
             var buttons = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, BackColor = Back, Padding = new Padding(0, 7, 0, 7) };
             buttons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 42));
@@ -671,7 +818,7 @@ namespace NetworkCorner
             buttons.Controls.Add(scanStartButton, 0, 0);
             buttons.Controls.Add(scanCancelButton, 1, 0);
             buttons.Controls.Add(MakeButton("Use gateway", delegate { UseGatewayTarget(); }, false, 0), 2, 0);
-            layout.Controls.Add(buttons, 0, 4);
+            layout.Controls.Add(buttons, 0, 5);
 
             var outputPanel = Card();
             scanOutputBox.Dock = DockStyle.Fill;
@@ -685,13 +832,15 @@ namespace NetworkCorner
             scanOutputBox.DetectUrls = false;
             scanOutputBox.Text = "Enter a hostname, IPv4 address, or CIDR range, then choose a scan type.\r\nOnly scan networks and devices you are authorised to test.";
             outputPanel.Controls.Add(scanOutputBox);
-            layout.Controls.Add(outputPanel, 0, 5);
+            layout.Controls.Add(outputPanel, 0, 6);
         }
 
         private void BuildPingTab(TabPage pingTab)
         {
-            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(14), ColumnCount = 1, RowCount = 5, BackColor = Back };
+            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(14), ColumnCount = 1, RowCount = 7, BackColor = Back };
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 56));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 56));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 56));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 55));
@@ -707,6 +856,26 @@ namespace NetworkCorner
             heading.Controls.Add(pingStatusLabel);
             layout.Controls.Add(heading, 0, 0);
 
+            var adapterRow = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, BackColor = Back, Padding = new Padding(0, 6, 0, 6) };
+            adapterRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 92));
+            adapterRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            adapterRow.Controls.Add(FieldLabel("ADAPTER"), 0, 0);
+            StyleCombo(pingAdapterBox);
+            pingAdapterBox.Dock = DockStyle.Fill;
+            pingAdapterBox.SelectedIndexChanged += delegate { if (!loading) PopulateGatewayTargetModes(pingAdapterBox, pingTargetModeBox, pingTargetBox, true); };
+            adapterRow.Controls.Add(pingAdapterBox, 1, 0);
+            layout.Controls.Add(adapterRow, 0, 1);
+
+            var modeRow = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, BackColor = Back, Padding = new Padding(0, 6, 0, 6) };
+            modeRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 92));
+            modeRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            modeRow.Controls.Add(FieldLabel("TARGET MODE"), 0, 0);
+            StyleCombo(pingTargetModeBox);
+            pingTargetModeBox.Dock = DockStyle.Fill;
+            pingTargetModeBox.SelectedIndexChanged += delegate { if (!loading) ApplyGatewayTargetMode(pingTargetModeBox, pingTargetBox); };
+            modeRow.Controls.Add(pingTargetModeBox, 1, 0);
+            layout.Controls.Add(modeRow, 0, 2);
+
             var targetRow = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, BackColor = Back, Padding = new Padding(0, 6, 0, 6) };
             targetRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 92));
             targetRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -715,14 +884,15 @@ namespace NetworkCorner
             pingTargetBox.BorderStyle = BorderStyle.FixedSingle;
             pingTargetBox.BackColor = Color.FromArgb(42, 50, 62);
             pingTargetBox.ForeColor = Color.White;
+            pingTargetBox.TextChanged += delegate { if (!loading) SelectManualModeIfChanged(pingTargetModeBox, pingTargetBox); };
             targetRow.Controls.Add(pingTargetBox, 1, 0);
-            layout.Controls.Add(targetRow, 0, 1);
+            layout.Controls.Add(targetRow, 0, 3);
 
             continuousPingCheck.Text = "Continuous ping (runs until stopped)";
             continuousPingCheck.Dock = DockStyle.Fill;
             continuousPingCheck.ForeColor = Color.White;
             continuousPingCheck.Padding = new Padding(92, 0, 0, 0);
-            layout.Controls.Add(continuousPingCheck, 0, 2);
+            layout.Controls.Add(continuousPingCheck, 0, 4);
 
             var buttons = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, BackColor = Back, Padding = new Padding(0, 7, 0, 7) };
             buttons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 40));
@@ -734,7 +904,7 @@ namespace NetworkCorner
             buttons.Controls.Add(pingStartButton, 0, 0);
             buttons.Controls.Add(pingStopButton, 1, 0);
             buttons.Controls.Add(MakeButton("Use gateway", delegate { UseGatewayForPing(); }, false, 0), 2, 0);
-            layout.Controls.Add(buttons, 0, 3);
+            layout.Controls.Add(buttons, 0, 5);
 
             var outputPanel = Card();
             pingOutputBox.Dock = DockStyle.Fill;
@@ -748,14 +918,14 @@ namespace NetworkCorner
             pingOutputBox.DetectUrls = false;
             pingOutputBox.Text = "Enter a hostname or IP address. Enable Continuous ping to run until you press Stop.";
             outputPanel.Controls.Add(pingOutputBox);
-            layout.Controls.Add(outputPanel, 0, 4);
+            layout.Controls.Add(outputPanel, 0, 6);
         }
 
         private void BuildConnectionTab(TabPage connectionTab)
         {
-            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(14), ColumnCount = 1, RowCount = 7, BackColor = Back };
+            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(14), ColumnCount = 1, RowCount = 9, BackColor = Back };
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
-            for (int i = 1; i <= 4; i++) layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 56));
+            for (int i = 1; i <= 6; i++) layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 56));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 55));
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             connectionTab.Controls.Add(layout);
@@ -769,6 +939,20 @@ namespace NetworkCorner
             heading.Controls.Add(connectionStatusLabel);
             layout.Controls.Add(heading, 0, 0);
 
+            var adapterRow = ConnectionRow("ADAPTER");
+            StyleCombo(connectionAdapterBox);
+            connectionAdapterBox.Dock = DockStyle.Fill;
+            connectionAdapterBox.SelectedIndexChanged += delegate { if (!loading) PopulateGatewayTargetModes(connectionAdapterBox, connectionTargetModeBox, connectionHostBox, true); };
+            adapterRow.Controls.Add(connectionAdapterBox, 1, 0);
+            layout.Controls.Add(adapterRow, 0, 1);
+
+            var modeRow = ConnectionRow("TARGET MODE");
+            StyleCombo(connectionTargetModeBox);
+            connectionTargetModeBox.Dock = DockStyle.Fill;
+            connectionTargetModeBox.SelectedIndexChanged += delegate { if (!loading) ApplyGatewayTargetMode(connectionTargetModeBox, connectionHostBox); };
+            modeRow.Controls.Add(connectionTargetModeBox, 1, 0);
+            layout.Controls.Add(modeRow, 0, 2);
+
             var protocolRow = ConnectionRow("PROTOCOL");
             StyleCombo(connectionProtocolBox);
             connectionProtocolBox.Dock = DockStyle.Fill;
@@ -781,12 +965,13 @@ namespace NetworkCorner
                 connectionUsernameBox.BackColor = ssh ? Color.FromArgb(42, 50, 62) : Color.FromArgb(31, 37, 46);
             };
             protocolRow.Controls.Add(connectionProtocolBox, 1, 0);
-            layout.Controls.Add(protocolRow, 0, 1);
+            layout.Controls.Add(protocolRow, 0, 3);
 
             var hostRow = ConnectionRow("HOST");
             StyleConnectionTextBox(connectionHostBox);
+            connectionHostBox.TextChanged += delegate { if (!loading) SelectManualModeIfChanged(connectionTargetModeBox, connectionHostBox); };
             hostRow.Controls.Add(connectionHostBox, 1, 0);
-            layout.Controls.Add(hostRow, 0, 2);
+            layout.Controls.Add(hostRow, 0, 4);
 
             var portRow = ConnectionRow("PORT");
             connectionPortBox.Dock = DockStyle.Fill;
@@ -797,19 +982,19 @@ namespace NetworkCorner
             connectionPortBox.ForeColor = Color.White;
             connectionPortBox.BorderStyle = BorderStyle.FixedSingle;
             portRow.Controls.Add(connectionPortBox, 1, 0);
-            layout.Controls.Add(portRow, 0, 3);
+            layout.Controls.Add(portRow, 0, 5);
 
             var usernameRow = ConnectionRow("USERNAME");
             StyleConnectionTextBox(connectionUsernameBox);
             usernameRow.Controls.Add(connectionUsernameBox, 1, 0);
-            layout.Controls.Add(usernameRow, 0, 4);
+            layout.Controls.Add(usernameRow, 0, 6);
 
             var buttons = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, BackColor = Back, Padding = new Padding(0, 7, 0, 7) };
             buttons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 58));
             buttons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 42));
             buttons.Controls.Add(MakeButton("Open connection", delegate { OpenConnection(); }, true, 0), 0, 0);
             buttons.Controls.Add(MakeButton("Use gateway", delegate { UseGatewayForConnection(); }, false, 0), 1, 0);
-            layout.Controls.Add(buttons, 0, 5);
+            layout.Controls.Add(buttons, 0, 7);
 
             var notePanel = Card();
             var note = new Label
@@ -821,8 +1006,231 @@ namespace NetworkCorner
                 Text = "The selected client opens in a separate interactive terminal.\r\n\r\nSSH uses the Windows OpenSSH client. Telnet uses the Windows Telnet client. Passwords and authentication prompts are handled only by that terminal and are never stored by Network Corner."
             };
             notePanel.Controls.Add(note);
-            layout.Controls.Add(notePanel, 0, 6);
+            layout.Controls.Add(notePanel, 0, 8);
             connectionProtocolBox.SelectedIndex = 0;
+        }
+
+        private void BuildDiagnosticsTab(TabPage diagnosticsTab)
+        {
+            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(14), ColumnCount = 1, RowCount = 5, BackColor = Back };
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 56));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 56));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 180));
+            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            diagnosticsTab.Controls.Add(layout);
+
+            var heading = new Panel { Dock = DockStyle.Fill };
+            heading.Controls.Add(new Label { Text = "NETWORK DIAGNOSTICS", Font = new Font("Segoe UI Semibold", 14F), AutoSize = true, Location = new Point(0, 2), ForeColor = Color.White });
+            diagnosticsStatusLabel.Text = "Ready";
+            diagnosticsStatusLabel.AutoSize = true;
+            diagnosticsStatusLabel.Location = new Point(2, 31);
+            diagnosticsStatusLabel.ForeColor = Muted;
+            heading.Controls.Add(diagnosticsStatusLabel);
+            layout.Controls.Add(heading, 0, 0);
+
+            var targetRow = ConnectionRow("TARGET");
+            StyleConnectionTextBox(diagnosticsTargetBox);
+            targetRow.Controls.Add(diagnosticsTargetBox, 1, 0);
+            layout.Controls.Add(targetRow, 0, 1);
+
+            var portRow = ConnectionRow("TCP PORT");
+            diagnosticsPortBox.Dock = DockStyle.Fill;
+            diagnosticsPortBox.Minimum = 1;
+            diagnosticsPortBox.Maximum = 65535;
+            diagnosticsPortBox.Value = 80;
+            diagnosticsPortBox.BackColor = Color.FromArgb(42, 50, 62);
+            diagnosticsPortBox.ForeColor = Color.White;
+            diagnosticsPortBox.BorderStyle = BorderStyle.FixedSingle;
+            portRow.Controls.Add(diagnosticsPortBox, 1, 0);
+            layout.Controls.Add(portRow, 0, 2);
+
+            var actions = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 4, BackColor = Back, Padding = new Padding(0, 5, 0, 5) };
+            actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+            actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+            for (int i = 0; i < 4; i++) actions.RowStyles.Add(new RowStyle(SizeType.Percent, 25));
+            actions.Controls.Add(MakeButton("DNS lookup", delegate { RunDnsLookup(); }, false, 0), 0, 0);
+            actions.Controls.Add(MakeButton("Traceroute", delegate { RunTraceroute(); }, false, 0), 1, 0);
+            actions.Controls.Add(MakeButton("TCP port test", delegate { RunTcpPortTest(); }, false, 0), 0, 1);
+            actions.Controls.Add(MakeButton("Public IP", delegate { RunPublicIpLookup(); }, false, 0), 1, 1);
+            actions.Controls.Add(MakeButton("ARP table", delegate { StartDiagnosticProcess("ARP table", "arp.exe", "-a"); }, false, 0), 0, 2);
+            actions.Controls.Add(MakeButton("Routing table", delegate { StartDiagnosticProcess("Routing table", "route.exe", "print"); }, false, 0), 1, 2);
+            actions.Controls.Add(MakeButton("Flush DNS", delegate { FlushDns(); }, false, 0), 0, 3);
+            diagnosticsStopButton = MakeButton("Stop", delegate { StopDiagnostic(); }, false, 0);
+            diagnosticsStopButton.Enabled = false;
+            actions.Controls.Add(diagnosticsStopButton, 1, 3);
+            layout.Controls.Add(actions, 0, 3);
+
+            var outputPanel = Card();
+            diagnosticsOutputBox.Dock = DockStyle.Fill;
+            diagnosticsOutputBox.ReadOnly = true;
+            diagnosticsOutputBox.BackColor = Color.FromArgb(15, 20, 26);
+            diagnosticsOutputBox.ForeColor = Color.FromArgb(214, 225, 235);
+            diagnosticsOutputBox.BorderStyle = BorderStyle.None;
+            diagnosticsOutputBox.Font = summaryRegularFont;
+            diagnosticsOutputBox.WordWrap = false;
+            diagnosticsOutputBox.ScrollBars = RichTextBoxScrollBars.Both;
+            diagnosticsOutputBox.DetectUrls = false;
+            diagnosticsOutputBox.Text = "Choose a diagnostic. Target-based tools use the hostname or IP address above.";
+            outputPanel.Controls.Add(diagnosticsOutputBox);
+            layout.Controls.Add(outputPanel, 0, 4);
+        }
+
+        private void RunDnsLookup()
+        {
+            string target = diagnosticsTargetBox.Text.Trim();
+            string validation = ConnectionSupport.ValidateHost(target);
+            if (validation != null) { MessageBox.Show(this, validation, "Check diagnostic target", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+            StartBackgroundDiagnostic("DNS lookup", delegate
+            {
+                IPAddress[] addresses = Dns.GetHostAddresses(target);
+                return "DNS results for " + target + ":\r\n\r\n" + String.Join("\r\n", addresses.Select(x => x.ToString()).ToArray());
+            });
+        }
+
+        private void RunTraceroute()
+        {
+            string target = diagnosticsTargetBox.Text.Trim();
+            string validation = ConnectionSupport.ValidateHost(target);
+            if (validation != null) { MessageBox.Show(this, validation, "Check diagnostic target", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+            StartDiagnosticProcess("Traceroute", "tracert.exe", "-d " + target);
+        }
+
+        private void RunTcpPortTest()
+        {
+            string target = diagnosticsTargetBox.Text.Trim();
+            string validation = ConnectionSupport.ValidateHost(target);
+            if (validation != null) { MessageBox.Show(this, validation, "Check diagnostic target", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+            int port = Decimal.ToInt32(diagnosticsPortBox.Value);
+            StartBackgroundDiagnostic("TCP port test", delegate
+            {
+                using (var client = new TcpClient())
+                {
+                    IAsyncResult result = client.BeginConnect(target, port, null, null);
+                    bool connected = result.AsyncWaitHandle.WaitOne(2500);
+                    if (!connected) return "TCP " + target + ":" + port + " did not respond within 2.5 seconds.";
+                    client.EndConnect(result);
+                    return "TCP " + target + ":" + port + " is open and accepted a connection.";
+                }
+            });
+        }
+
+        private void RunPublicIpLookup()
+        {
+            StartBackgroundDiagnostic("Public IP lookup", delegate
+            {
+                ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072;
+                using (var client = new WebClient())
+                {
+                    client.Headers[HttpRequestHeader.UserAgent] = "NetworkCorner/1.0";
+                    string address = client.DownloadString("https://api.ipify.org").Trim();
+                    return "Public IP address:\r\n\r\n" + address;
+                }
+            });
+        }
+
+        private void StartBackgroundDiagnostic(string label, Func<string> work)
+        {
+            if (diagnosticBusy) { MessageBox.Show(this, "Another diagnostic is already running.", "Diagnostic busy", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
+            diagnosticBusy = true;
+            diagnosticsStopButton.Enabled = false;
+            diagnosticsStatusLabel.Text = label + " running…";
+            diagnosticsStatusLabel.ForeColor = Color.FromArgb(74, 193, 255);
+            diagnosticsOutputBox.Clear();
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                string result;
+                bool success = true;
+                try { result = work(); }
+                catch (Exception ex) { result = ex.Message; success = false; }
+                try
+                {
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        AppendDiagnosticOutput(result + "\r\n", success ? Color.FromArgb(214, 225, 235) : Color.FromArgb(255, 130, 130));
+                        diagnosticsStatusLabel.Text = success ? label + " complete" : label + " failed";
+                        diagnosticsStatusLabel.ForeColor = success ? Color.FromArgb(92, 214, 147) : Color.FromArgb(255, 130, 130);
+                        diagnosticBusy = false;
+                    });
+                }
+                catch { diagnosticBusy = false; }
+            });
+        }
+
+        private void StartDiagnosticProcess(string label, string executable, string arguments)
+        {
+            if (diagnosticBusy) { MessageBox.Show(this, "Another diagnostic is already running.", "Diagnostic busy", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
+            var process = new Process();
+            process.StartInfo = new ProcessStartInfo(executable, arguments);
+            process.StartInfo.UseShellExecute = false;
+            process.StartInfo.CreateNoWindow = true;
+            process.StartInfo.RedirectStandardOutput = true;
+            process.StartInfo.RedirectStandardError = true;
+            process.EnableRaisingEvents = true;
+            process.OutputDataReceived += delegate(object sender, DataReceivedEventArgs e) { if (e.Data != null) AppendDiagnosticOutputSafe(e.Data + "\r\n", Color.FromArgb(214, 225, 235)); };
+            process.ErrorDataReceived += delegate(object sender, DataReceivedEventArgs e) { if (e.Data != null) AppendDiagnosticOutputSafe(e.Data + "\r\n", Color.FromArgb(255, 130, 130)); };
+            process.Exited += delegate
+            {
+                int exitCode = process.ExitCode;
+                try
+                {
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        diagnosticsStatusLabel.Text = exitCode == 0 ? label + " complete" : label + " failed • exit code " + exitCode;
+                        diagnosticsStatusLabel.ForeColor = exitCode == 0 ? Color.FromArgb(92, 214, 147) : Color.FromArgb(255, 130, 130);
+                        diagnosticsStopButton.Enabled = false;
+                        currentDiagnostic = null;
+                        diagnosticBusy = false;
+                        process.Dispose();
+                    });
+                }
+                catch { process.Dispose(); }
+            };
+            try
+            {
+                diagnosticsOutputBox.Clear();
+                diagnosticsStatusLabel.Text = label + " running…";
+                diagnosticsStatusLabel.ForeColor = Color.FromArgb(74, 193, 255);
+                diagnosticBusy = true;
+                currentDiagnostic = process;
+                process.Start();
+                process.BeginOutputReadLine();
+                process.BeginErrorReadLine();
+                diagnosticsStopButton.Enabled = true;
+            }
+            catch (Exception ex)
+            {
+                diagnosticBusy = false;
+                currentDiagnostic = null;
+                process.Dispose();
+                MessageBox.Show(this, ex.Message, "Could not start diagnostic", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void StopDiagnostic()
+        {
+            try { if (currentDiagnostic != null && !currentDiagnostic.HasExited) currentDiagnostic.Kill(); }
+            catch (Exception ex) { MessageBox.Show(this, ex.Message, "Could not stop diagnostic", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+        }
+
+        private void FlushDns()
+        {
+            ExecuteElevatedRequest(new ChangeRequest { Operation = "flushdns" }, "This will clear the Windows DNS resolver cache. Continue?");
+        }
+
+        private void AppendDiagnosticOutputSafe(string text, Color color)
+        {
+            try { BeginInvoke((MethodInvoker)delegate { AppendDiagnosticOutput(text, color); }); } catch { }
+        }
+
+        private void AppendDiagnosticOutput(string text, Color color)
+        {
+            diagnosticsOutputBox.SelectionStart = diagnosticsOutputBox.TextLength;
+            diagnosticsOutputBox.SelectionLength = 0;
+            diagnosticsOutputBox.SelectionColor = color;
+            diagnosticsOutputBox.AppendText(text);
+            diagnosticsOutputBox.SelectionStart = diagnosticsOutputBox.TextLength;
+            diagnosticsOutputBox.ScrollToCaret();
         }
 
         private TableLayoutPanel ConnectionRow(string label)
@@ -853,6 +1261,12 @@ namespace NetworkCorner
                 MessageBox.Show(this, validation, "Check connection settings", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
+            AdapterInfo selectedAdapter = connectionAdapterBox.SelectedItem as AdapterInfo;
+            if (selectedAdapter == null)
+            {
+                MessageBox.Show(this, "Choose an adapter for the connection.", "Adapter required", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
 
             bool ssh = connectionProtocolBox.SelectedIndex == 0;
             int port = Decimal.ToInt32(connectionPortBox.Value);
@@ -866,7 +1280,7 @@ namespace NetworkCorner
 
             try
             {
-                var start = new ProcessStartInfo(executable, ConnectionSupport.BuildClientArguments(ssh, host, port, connectionUsernameBox.Text));
+                var start = new ProcessStartInfo(executable, ConnectionSupport.BuildClientArguments(ssh, host, port, connectionUsernameBox.Text, ssh ? selectedAdapter.Address : null));
                 start.UseShellExecute = true;
                 Process.Start(start);
                 connectionStatusLabel.Text = (ssh ? "SSH" : "Telnet") + " client opened for " + host + ":" + port;
@@ -880,7 +1294,7 @@ namespace NetworkCorner
 
         private void UseGatewayForConnection()
         {
-            AdapterInfo selected = adapterBox.SelectedItem as AdapterInfo;
+            AdapterInfo selected = connectionAdapterBox.SelectedItem as AdapterInfo;
             if (selected == null || String.IsNullOrWhiteSpace(selected.Gateway))
             {
                 MessageBox.Show(this, "The selected adapter does not currently report an IPv4 gateway.", "Gateway unavailable", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -899,12 +1313,18 @@ namespace NetworkCorner
                 MessageBox.Show(this, validation, "Check ping target", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
+            AdapterInfo selectedAdapter = pingAdapterBox.SelectedItem as AdapterInfo;
+            if (selectedAdapter == null || String.IsNullOrWhiteSpace(selectedAdapter.Address))
+            {
+                MessageBox.Show(this, "Choose an adapter with an IPv4 address.", "Adapter required", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
 
             bool continuous = continuousPingCheck.Checked;
             pingOutputBox.Clear();
-            AppendPingOutput("Pinging " + target + (continuous ? " continuously" : " four times") + "…\r\n\r\n", Accent);
+            AppendPingOutput("Pinging " + target + (continuous ? " continuously" : " four times") + "…\r\nAdapter: " + selectedAdapter + " (source " + selectedAdapter.Address + ")\r\n\r\n", Accent);
             var process = new Process();
-            process.StartInfo = new ProcessStartInfo("ping.exe", PingSupport.ArgumentsFor(target, continuous));
+            process.StartInfo = new ProcessStartInfo("ping.exe", PingSupport.ArgumentsFor(target, continuous, selectedAdapter.Address));
             process.StartInfo.UseShellExecute = false;
             process.StartInfo.CreateNoWindow = true;
             process.StartInfo.RedirectStandardOutput = true;
@@ -974,7 +1394,7 @@ namespace NetworkCorner
 
         private void UseGatewayForPing()
         {
-            AdapterInfo selected = adapterBox.SelectedItem as AdapterInfo;
+            AdapterInfo selected = pingAdapterBox.SelectedItem as AdapterInfo;
             if (selected == null || String.IsNullOrWhiteSpace(selected.Gateway))
             {
                 MessageBox.Show(this, "The selected adapter does not currently report an IPv4 gateway.", "Gateway unavailable", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -1015,11 +1435,27 @@ namespace NetworkCorner
                 MessageBox.Show(this, "Nmap was not found. Install Nmap for Windows and reopen Network Corner.", "Nmap unavailable", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
             }
+            AdapterInfo selectedAdapter = scanAdapterBox.SelectedItem as AdapterInfo;
+            if (selectedAdapter == null)
+            {
+                MessageBox.Show(this, "Choose an adapter for the scan.", "Adapter required", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            string interfaceName;
+            if (!nmapInterfaces.TryGetValue((selectedAdapter.Id ?? "").Trim('{', '}'), out interfaceName))
+            {
+                nmapInterfaces = NmapSupport.GetInterfaceMap(executable);
+                if (!nmapInterfaces.TryGetValue((selectedAdapter.Id ?? "").Trim('{', '}'), out interfaceName))
+                {
+                    MessageBox.Show(this, "Nmap could not map the selected Windows adapter to a capture interface. Refresh the adapter list and try again.", "Nmap interface unavailable", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+            }
 
             scanOutputBox.Clear();
-            AppendScanOutput("Scanning " + target + " using “" + scanPresetBox.SelectedItem + "”…\r\n\r\n", Accent);
+            AppendScanOutput("Scanning " + target + " using “" + scanPresetBox.SelectedItem + "”\r\nAdapter: " + selectedAdapter + " (" + interfaceName + ")\r\n\r\n", Accent);
             var process = new Process();
-            process.StartInfo = new ProcessStartInfo(executable, NmapSupport.ArgumentsFor(scanPresetBox.SelectedIndex, target));
+            process.StartInfo = new ProcessStartInfo(executable, NmapSupport.ArgumentsFor(scanPresetBox.SelectedIndex, target, interfaceName));
             process.StartInfo.UseShellExecute = false;
             process.StartInfo.CreateNoWindow = true;
             process.StartInfo.RedirectStandardOutput = true;
@@ -1085,7 +1521,7 @@ namespace NetworkCorner
 
         private void UseGatewayTarget()
         {
-            AdapterInfo selected = adapterBox.SelectedItem as AdapterInfo;
+            AdapterInfo selected = scanAdapterBox.SelectedItem as AdapterInfo;
             if (selected == null || String.IsNullOrWhiteSpace(selected.Gateway))
             {
                 MessageBox.Show(this, "The selected adapter does not currently report an IPv4 gateway.", "Gateway unavailable", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -1189,39 +1625,145 @@ namespace NetworkCorner
             if (index < 0 && adapters.Count > 0) index = 0;
             if (index >= 0) adapterBox.SelectedIndex = index;
             RefreshScanNetworks();
+            RefreshToolAdapterChoices();
             loading = false;
             if (populate) PopulateFields();
+            UpdateDhcpButtons();
         }
 
         private void RefreshScanNetworks()
         {
+            string selectedAdapterId = null;
+            AdapterInfo previousAdapter = scanAdapterBox.SelectedItem as AdapterInfo;
+            if (previousAdapter != null) selectedAdapterId = previousAdapter.Id;
             string selectedTarget = null;
             ScanNetworkOption selected = scanNetworkBox.SelectedItem as ScanNetworkOption;
             if (selected != null) selectedTarget = selected.Target;
+            bool preserveManual = selected != null && selected.IsManual;
 
-            scanNetworkBox.Items.Clear();
-            scanNetworkBox.Items.Add(new ScanNetworkOption { Label = "Manual target", Target = null });
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (AdapterInfo adapter in adapters)
-            {
-                string target = NmapSupport.NetworkTarget(adapter.Address, adapter.Mask);
-                if (String.IsNullOrWhiteSpace(target) || !seen.Add(target)) continue;
-                scanNetworkBox.Items.Add(new ScanNetworkOption
-                {
-                    Label = adapter.Kind + " — " + adapter.Name + " — " + target,
-                    Target = target
-                });
-            }
-            int selectedIndex = 0;
+            if (nmapInterfaces.Count == 0) nmapInterfaces = NmapSupport.GetInterfaceMap(NmapSupport.FindExecutable());
+            scanAdapterBox.Items.Clear();
+            foreach (AdapterInfo adapter in adapters) scanAdapterBox.Items.Add(adapter);
+            int adapterIndex = adapters.FindIndex(x => String.Equals(x.Id, selectedAdapterId, StringComparison.OrdinalIgnoreCase));
+            if (adapterIndex < 0 && adapters.Count > 0) adapterIndex = 0;
+            if (adapterIndex >= 0) scanAdapterBox.SelectedIndex = adapterIndex;
+            PopulateScanNetworks(selectedTarget, preserveManual, false);
+        }
+
+        private void RefreshToolAdapterChoices()
+        {
+            RefreshAdapterCombo(pingAdapterBox);
+            RefreshAdapterCombo(connectionAdapterBox);
+            PopulateGatewayTargetModes(pingAdapterBox, pingTargetModeBox, pingTargetBox, false);
+            PopulateGatewayTargetModes(connectionAdapterBox, connectionTargetModeBox, connectionHostBox, false);
+        }
+
+        private void RefreshAdapterCombo(ComboBox box)
+        {
+            AdapterInfo previous = box.SelectedItem as AdapterInfo;
+            string selectedId = previous == null ? null : previous.Id;
+            box.Items.Clear();
+            foreach (AdapterInfo adapter in adapters) box.Items.Add(adapter);
+            int index = adapters.FindIndex(x => String.Equals(x.Id, selectedId, StringComparison.OrdinalIgnoreCase));
+            if (index < 0 && adapters.Count > 0) index = 0;
+            if (index >= 0) box.SelectedIndex = index;
+        }
+
+        private void PopulateGatewayTargetModes(ComboBox adapterChoice, ComboBox modeChoice, TextBox targetBox, bool updateTarget)
+        {
+            bool previousLoading = loading;
+            loading = true;
+            ScanNetworkOption previous = modeChoice.SelectedItem as ScanNetworkOption;
+            bool preserveManual = previous != null && previous.IsManual;
+            string selectedTarget = previous == null ? null : previous.Target;
+            modeChoice.Items.Clear();
+            AdapterInfo adapter = adapterChoice.SelectedItem as AdapterInfo;
+            if (adapter != null && !String.IsNullOrWhiteSpace(adapter.Gateway))
+                modeChoice.Items.Add(new ScanNetworkOption { Label = "Gateway IP — " + adapter.Gateway, Target = adapter.Gateway });
+            modeChoice.Items.Add(new ScanNetworkOption { Label = "Manual target", IsManual = true });
+            int manualIndex = modeChoice.Items.Count - 1;
+            int selectedIndex = preserveManual ? manualIndex : 0;
             if (!String.IsNullOrWhiteSpace(selectedTarget))
             {
-                for (int i = 1; i < scanNetworkBox.Items.Count; i++)
+                for (int i = 0; i < modeChoice.Items.Count; i++)
+                {
+                    ScanNetworkOption option = modeChoice.Items[i] as ScanNetworkOption;
+                    if (option != null && String.Equals(option.Target, selectedTarget, StringComparison.OrdinalIgnoreCase)) { selectedIndex = i; break; }
+                }
+            }
+            modeChoice.SelectedIndex = selectedIndex;
+            if (updateTarget || (previous == null && selectedIndex != manualIndex))
+            {
+                ScanNetworkOption option = modeChoice.SelectedItem as ScanNetworkOption;
+                if (option != null && !String.IsNullOrWhiteSpace(option.Target)) targetBox.Text = option.Target;
+            }
+            loading = previousLoading;
+        }
+
+        private void ApplyGatewayTargetMode(ComboBox modeChoice, TextBox targetBox)
+        {
+            ScanNetworkOption option = modeChoice.SelectedItem as ScanNetworkOption;
+            if (option == null || String.IsNullOrWhiteSpace(option.Target)) return;
+            loading = true;
+            targetBox.Text = option.Target;
+            loading = false;
+        }
+
+        private void SelectManualModeIfChanged(ComboBox modeChoice, TextBox targetBox)
+        {
+            ScanNetworkOption selected = modeChoice.SelectedItem as ScanNetworkOption;
+            if (selected == null || selected.IsManual || String.Equals(selected.Target, targetBox.Text.Trim(), StringComparison.OrdinalIgnoreCase)) return;
+            for (int i = 0; i < modeChoice.Items.Count; i++)
+            {
+                ScanNetworkOption option = modeChoice.Items[i] as ScanNetworkOption;
+                if (option != null && option.IsManual) { modeChoice.SelectedIndex = i; break; }
+            }
+        }
+
+        private void PopulateScanNetworks(string selectedTarget, bool preserveManual, bool updateTarget)
+        {
+            bool previousLoading = loading;
+            loading = true;
+            scanNetworkBox.Items.Clear();
+            AdapterInfo adapter = scanAdapterBox.SelectedItem as AdapterInfo;
+            if (adapter != null)
+            {
+                if (!String.IsNullOrWhiteSpace(adapter.Gateway))
+                {
+                    scanNetworkBox.Items.Add(new ScanNetworkOption
+                    {
+                        Label = "Gateway IP — " + adapter.Gateway,
+                        Target = adapter.Gateway
+                    });
+                }
+                string target = NmapSupport.NetworkTarget(adapter.Address, adapter.Mask);
+                if (!String.IsNullOrWhiteSpace(target))
+                {
+                    scanNetworkBox.Items.Add(new ScanNetworkOption
+                    {
+                        Label = "Full network scan — " + target,
+                        Target = target
+                    });
+                }
+            }
+            scanNetworkBox.Items.Add(new ScanNetworkOption { Label = "Manual target", Target = null, IsManual = true });
+            int manualIndex = scanNetworkBox.Items.Count - 1;
+            int selectedIndex = preserveManual ? manualIndex : 0;
+            if (!String.IsNullOrWhiteSpace(selectedTarget))
+            {
+                for (int i = 0; i < scanNetworkBox.Items.Count; i++)
                 {
                     ScanNetworkOption option = scanNetworkBox.Items[i] as ScanNetworkOption;
                     if (option != null && String.Equals(option.Target, selectedTarget, StringComparison.OrdinalIgnoreCase)) { selectedIndex = i; break; }
                 }
             }
             scanNetworkBox.SelectedIndex = selectedIndex;
+            if (updateTarget || (String.IsNullOrWhiteSpace(selectedTarget) && !preserveManual))
+            {
+                ScanNetworkOption option = scanNetworkBox.SelectedItem as ScanNetworkOption;
+                if (option != null && !String.IsNullOrWhiteSpace(option.Target)) scanTargetBox.Text = option.Target;
+            }
+            loading = previousLoading;
         }
 
         private static string Empty(string value) { return String.IsNullOrWhiteSpace(value) ? "—" : value; }
@@ -1244,7 +1786,7 @@ namespace NetworkCorner
         private void PopulateFields()
         {
             AdapterInfo a = adapterBox.SelectedItem as AdapterInfo;
-            if (a == null) return;
+            if (a == null) { UpdateDhcpButtons(); return; }
             addressBox.Text = a.Address;
             maskBox.Text = a.Mask;
             gatewayBox.Text = a.Gateway;
@@ -1252,7 +1794,17 @@ namespace NetworkCorner
             dns2Box.Text = a.Dns2;
             if (String.IsNullOrWhiteSpace(pingTargetBox.Text) && !String.IsNullOrWhiteSpace(a.Gateway)) pingTargetBox.Text = a.Gateway;
             if (String.IsNullOrWhiteSpace(connectionHostBox.Text) && !String.IsNullOrWhiteSpace(a.Gateway)) connectionHostBox.Text = a.Gateway;
+            if (String.IsNullOrWhiteSpace(diagnosticsTargetBox.Text) && !String.IsNullOrWhiteSpace(a.Gateway)) diagnosticsTargetBox.Text = a.Gateway;
             profileBox.SelectedIndex = -1;
+            UpdateDhcpButtons();
+        }
+
+        private void UpdateDhcpButtons()
+        {
+            AdapterInfo adapter = adapterBox.SelectedItem as AdapterInfo;
+            bool isDhcp = adapter != null && !String.IsNullOrWhiteSpace(adapter.Assignment) && adapter.Assignment.StartsWith("Dynamic", StringComparison.OrdinalIgnoreCase);
+            if (releaseIpButton != null) releaseIpButton.Enabled = isDhcp;
+            if (renewIpButton != null) renewIpButton.Enabled = isDhcp;
         }
 
         private ChangeRequest CurrentRequest(bool dhcp)
@@ -1279,8 +1831,53 @@ namespace NetworkCorner
                 MessageBox.Show(this, validation, "Check network settings", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
+            AdapterInfo selectedAdapter = adapterBox.SelectedItem as AdapterInfo;
+            if (!dhcp && StaticAddressAppearsInUse(request.Address, selectedAdapter))
+            {
+                string warning = "The proposed IP address " + request.Address + " responded on the network or is assigned to another local adapter. It may already be in use. Apply it anyway?";
+                if (MessageBox.Show(this, warning, "Possible IP address conflict", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+            }
             string action = dhcp ? "switch " + request.Adapter + " to DHCP" : "apply these static settings to " + request.Adapter;
-            if (MessageBox.Show(this, "This will " + action + ". Connectivity may briefly drop. Continue?", "Confirm network change", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+            ExecuteElevatedRequest(request, "This will " + action + ". Connectivity may briefly drop. Continue?");
+        }
+
+        private bool StaticAddressAppearsInUse(string address, AdapterInfo selectedAdapter)
+        {
+            if (selectedAdapter != null && String.Equals(selectedAdapter.Address, address, StringComparison.OrdinalIgnoreCase)) return false;
+            if (adapters.Any(x => x != selectedAdapter && String.Equals(x.Address, address, StringComparison.OrdinalIgnoreCase))) return true;
+            try
+            {
+                using (var ping = new Ping())
+                {
+                    PingReply reply = ping.Send(address, 700);
+                    return reply != null && reply.Status == IPStatus.Success;
+                }
+            }
+            catch { return false; }
+        }
+
+        private void RunIpOperation(string operation)
+        {
+            AdapterInfo adapter = adapterBox.SelectedItem as AdapterInfo;
+            var request = new ChangeRequest
+            {
+                Adapter = adapter == null ? "" : adapter.Name,
+                Operation = operation
+            };
+            string validation = RequestValidator.Validate(request);
+            if (validation != null)
+            {
+                MessageBox.Show(this, validation, "Check network adapter", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            string verb = operation == "release" ? "release" : "renew";
+            string warning = operation == "release" ? " This will temporarily remove its DHCP address." : "";
+            ExecuteElevatedRequest(request, "This will " + verb + " the DHCP lease for " + request.Adapter + "." + warning + " Continue?");
+        }
+
+        private void ExecuteElevatedRequest(ChangeRequest request, string confirmation)
+        {
+            if (MessageBox.Show(this, confirmation, "Confirm network change", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
 
             string tempPath = Path.Combine(Path.GetTempPath(), "NetworkCorner-" + Guid.NewGuid().ToString("N") + ".json");
             try
@@ -1304,6 +1901,46 @@ namespace NetworkCorner
             {
                 try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
             }
+        }
+
+        private void LoadPreferences()
+        {
+            if (!File.Exists(preferencesPath)) return;
+            try
+            {
+                AppPreferences preferences = new JavaScriptSerializer().Deserialize<AppPreferences>(File.ReadAllText(preferencesPath, Encoding.UTF8));
+                if (preferences == null) return;
+                loading = true;
+                if (preferences.WindowWidth >= MinimumSize.Width && preferences.WindowHeight >= MinimumSize.Height)
+                    Size = new Size(preferences.WindowWidth, preferences.WindowHeight);
+                if (preferences.MonitorIndex >= 0 && preferences.MonitorIndex < screenBox.Items.Count) screenBox.SelectedIndex = preferences.MonitorIndex;
+                if (preferences.CornerIndex >= 0 && preferences.CornerIndex < cornerBox.Items.Count) cornerBox.SelectedIndex = preferences.CornerIndex;
+                fullHeightCheck.Checked = preferences.FullHeight;
+                hideDownCheck.Checked = preferences.HideDownAdapters;
+                if (preferences.SelectedTabIndex >= 0 && preferences.SelectedTabIndex < mainTabs.TabPages.Count) mainTabs.SelectedIndex = preferences.SelectedTabIndex;
+                loading = false;
+            }
+            catch { loading = false; }
+        }
+
+        private void SavePreferences()
+        {
+            try
+            {
+                var preferences = new AppPreferences
+                {
+                    MonitorIndex = screenBox.SelectedIndex,
+                    CornerIndex = cornerBox.SelectedIndex,
+                    FullHeight = fullHeightCheck.Checked,
+                    HideDownAdapters = hideDownCheck.Checked,
+                    SelectedTabIndex = mainTabs.SelectedIndex,
+                    WindowWidth = Width,
+                    WindowHeight = fullHeightCheck.Checked && normalHeight > 0 ? normalHeight : Height
+                };
+                Directory.CreateDirectory(Path.GetDirectoryName(preferencesPath));
+                File.WriteAllText(preferencesPath, new JavaScriptSerializer().Serialize(preferences), Encoding.UTF8);
+            }
+            catch { }
         }
 
         private void LoadProfiles()
@@ -1432,18 +2069,27 @@ namespace NetworkCorner
             failures += Check(dhcp.Count == 2 && dhcp[0].Contains("source=dhcp"), "DHCP commands");
             var stat = NetworkChanger.BuildCommands(new ChangeRequest { Adapter = "Ethernet", Address = "10.0.0.2", Mask = "255.255.255.0", Gateway = "10.0.0.1", Dns1 = "1.1.1.1", Dns2 = "8.8.8.8" });
             failures += Check(stat.Count == 3 && stat[2].Contains("index=2"), "static commands");
+            failures += Check(RequestValidator.Validate(new ChangeRequest { Adapter = "Ethernet", Operation = "release" }) == null, "valid DHCP release request");
+            failures += Check(NetworkChanger.BuildIpconfigArguments(new ChangeRequest { Adapter = "Ethernet", Operation = "renew" }) == "/renew \"Ethernet\"", "DHCP renew command");
+            failures += Check(RequestValidator.Validate(new ChangeRequest { Operation = "flushdns" }) == null, "valid DNS flush request");
+            failures += Check(NetworkChanger.BuildIpconfigArguments(new ChangeRequest { Operation = "flushdns" }) == "/flushdns", "DNS flush command");
             failures += Check(NmapSupport.ValidateTarget("192.168.1.0/24") == null, "valid Nmap CIDR target");
             failures += Check(NmapSupport.ValidateTarget("-iL file.txt") != null, "reject Nmap option injection");
             failures += Check(NmapSupport.ArgumentsFor(1, "router.local").Contains("--top-ports 100"), "Nmap quick scan preset");
+            failures += Check(NmapSupport.ArgumentsFor(0, "192.168.1.0/24", "eth4").Contains("-e eth4"), "Nmap adapter argument");
+            var interfaceMap = NmapSupport.ParseInterfaceMap("eth4   \\Device\\NPF_{8E11A7AA-6A36-4998-9B3B-7DED87E0E3AC}\r\n");
+            failures += Check(interfaceMap.ContainsKey("8E11A7AA-6A36-4998-9B3B-7DED87E0E3AC") && interfaceMap["8E11A7AA-6A36-4998-9B3B-7DED87E0E3AC"] == "eth4", "map Windows adapter to Nmap interface");
             failures += Check(NmapSupport.NetworkTarget("192.168.8.42", "255.255.255.0") == "192.168.8.0/24", "derive Nmap network target");
             failures += Check(NmapSupport.NetworkTarget("10.20.31.4", "255.255.240.0") == "10.20.16.0/20", "derive non-/24 network target");
             failures += Check(PingSupport.ValidateTarget("router.local") == null, "valid ping hostname");
             failures += Check(PingSupport.ValidateTarget("192.168.1.0/24") != null, "reject ping network range");
             failures += Check(PingSupport.ArgumentsFor("192.168.1.1", true) == "-t 192.168.1.1", "continuous ping arguments");
+            failures += Check(PingSupport.ArgumentsFor("192.168.1.1", false, "192.168.1.10") == "-n 4 -S 192.168.1.10 192.168.1.1", "ping adapter binding");
             failures += Check(ConnectionSupport.ValidateHost("router.local") == null, "valid SSH host");
             failures += Check(ConnectionSupport.ValidateUsername("lab-admin") == null, "valid SSH username");
             failures += Check(ConnectionSupport.ValidateUsername("name & command") != null, "reject SSH username injection");
             failures += Check(ConnectionSupport.BuildClientArguments(true, "192.168.1.1", 2222, "admin") == "-p 2222 admin@192.168.1.1", "SSH client arguments");
+            failures += Check(ConnectionSupport.BuildClientArguments(true, "192.168.1.1", 22, "admin", "192.168.1.10") == "-b 192.168.1.10 -p 22 admin@192.168.1.1", "SSH adapter binding");
             failures += Check(ConnectionSupport.BuildClientArguments(false, "192.168.1.1", 23, "") == "192.168.1.1 23", "Telnet client arguments");
             Console.WriteLine(failures == 0 ? "All self-tests passed." : failures + " self-test(s) failed.");
             return failures == 0 ? 0 : 1;

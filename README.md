@@ -61,7 +61,9 @@ The built-in **TFTP** profile uses IP `192.168.1.10`, subnet mask `255.255.255.0
 - Profiles are stored per user in `%LOCALAPPDATA%\NetworkCorner\profiles.json`.
 - The utility changes IPv4 only. IPv6 is not modified.
 
-Window size, selected monitor and corner, full-height mode, hidden-adapter preference, and selected tab are saved per user in `%LOCALAPPDATA%\NetworkCorner\settings.json`.
+Adapter selection is synchronized across the Network, Nmap, Ping, and Telnet/SSH tabs. Changing it in any tab updates the others.
+
+Window size, selected monitor and corner, full-height mode, hidden-adapter preference, selected adapter, and selected tab are saved per user in `%LOCALAPPDATA%\NetworkCorner\settings.json`.
 
 ## Rebuild
 

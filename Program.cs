@@ -57,6 +57,7 @@ namespace NetworkCorner
         public bool FullHeight { get; set; }
         public bool HideDownAdapters { get; set; }
         public int SelectedTabIndex { get; set; }
+        public string SelectedAdapterId { get; set; }
         public int WindowWidth { get; set; }
         public int WindowHeight { get; set; }
     }
@@ -547,6 +548,8 @@ namespace NetworkCorner
         private List<AdapterInfo> adapters = new List<AdapterInfo>();
         private List<NetworkProfile> profiles = new List<NetworkProfile>();
         private bool loading;
+        private bool syncingAdapters;
+        private string selectedAdapterId;
         private int normalHeight;
         private Process currentScan;
         private Process currentPing;
@@ -656,7 +659,7 @@ namespace NetworkCorner
             adapterPanel.Controls.Add(FieldLabel("EDIT"), 0, 0);
             StyleCombo(adapterBox);
             adapterBox.Dock = DockStyle.Fill;
-            adapterBox.SelectedIndexChanged += delegate { if (!loading) PopulateFields(); };
+            adapterBox.SelectedIndexChanged += delegate { if (!loading) SyncAdapterSelection(adapterBox); };
             adapterPanel.Controls.Add(adapterBox, 1, 0);
             root.Controls.Add(adapterPanel, 0, 2);
 
@@ -748,7 +751,7 @@ namespace NetworkCorner
             adapterRow.Controls.Add(FieldLabel("ADAPTER"), 0, 0);
             StyleCombo(scanAdapterBox);
             scanAdapterBox.Dock = DockStyle.Fill;
-            scanAdapterBox.SelectedIndexChanged += delegate { if (!loading) PopulateScanNetworks(null, false, true); };
+            scanAdapterBox.SelectedIndexChanged += delegate { if (!loading) SyncAdapterSelection(scanAdapterBox); };
             adapterRow.Controls.Add(scanAdapterBox, 1, 0);
             layout.Controls.Add(adapterRow, 0, 1);
 
@@ -862,7 +865,7 @@ namespace NetworkCorner
             adapterRow.Controls.Add(FieldLabel("ADAPTER"), 0, 0);
             StyleCombo(pingAdapterBox);
             pingAdapterBox.Dock = DockStyle.Fill;
-            pingAdapterBox.SelectedIndexChanged += delegate { if (!loading) PopulateGatewayTargetModes(pingAdapterBox, pingTargetModeBox, pingTargetBox, true); };
+            pingAdapterBox.SelectedIndexChanged += delegate { if (!loading) SyncAdapterSelection(pingAdapterBox); };
             adapterRow.Controls.Add(pingAdapterBox, 1, 0);
             layout.Controls.Add(adapterRow, 0, 1);
 
@@ -942,7 +945,7 @@ namespace NetworkCorner
             var adapterRow = ConnectionRow("ADAPTER");
             StyleCombo(connectionAdapterBox);
             connectionAdapterBox.Dock = DockStyle.Fill;
-            connectionAdapterBox.SelectedIndexChanged += delegate { if (!loading) PopulateGatewayTargetModes(connectionAdapterBox, connectionTargetModeBox, connectionHostBox, true); };
+            connectionAdapterBox.SelectedIndexChanged += delegate { if (!loading) SyncAdapterSelection(connectionAdapterBox); };
             adapterRow.Controls.Add(connectionAdapterBox, 1, 0);
             layout.Controls.Add(adapterRow, 0, 1);
 
@@ -1589,7 +1592,8 @@ namespace NetworkCorner
 
         private void RefreshAdapters(bool populate)
         {
-            string selected = adapterBox.SelectedItem is AdapterInfo ? ((AdapterInfo)adapterBox.SelectedItem).Name : null;
+            AdapterInfo currentSelection = adapterBox.SelectedItem as AdapterInfo;
+            string desiredAdapterId = !String.IsNullOrWhiteSpace(selectedAdapterId) ? selectedAdapterId : (currentSelection == null ? null : currentSelection.Id);
             List<AdapterInfo> detectedAdapters = NetworkReader.GetAdapters();
             adapters = hideDownCheck.Checked ? detectedAdapters.Where(x => x.Status == "Connected").ToList() : detectedAdapters;
             summaryBox.SuspendLayout();
@@ -1621,9 +1625,13 @@ namespace NetworkCorner
             loading = true;
             adapterBox.Items.Clear();
             foreach (AdapterInfo a in adapters) adapterBox.Items.Add(a);
-            int index = adapters.FindIndex(x => x.Name == selected);
+            int index = adapters.FindIndex(x => String.Equals(x.Id, desiredAdapterId, StringComparison.OrdinalIgnoreCase));
             if (index < 0 && adapters.Count > 0) index = 0;
-            if (index >= 0) adapterBox.SelectedIndex = index;
+            if (index >= 0)
+            {
+                adapterBox.SelectedIndex = index;
+                selectedAdapterId = adapters[index].Id;
+            }
             RefreshScanNetworks();
             RefreshToolAdapterChoices();
             loading = false;
@@ -1633,9 +1641,6 @@ namespace NetworkCorner
 
         private void RefreshScanNetworks()
         {
-            string selectedAdapterId = null;
-            AdapterInfo previousAdapter = scanAdapterBox.SelectedItem as AdapterInfo;
-            if (previousAdapter != null) selectedAdapterId = previousAdapter.Id;
             string selectedTarget = null;
             ScanNetworkOption selected = scanNetworkBox.SelectedItem as ScanNetworkOption;
             if (selected != null) selectedTarget = selected.Target;
@@ -1660,13 +1665,46 @@ namespace NetworkCorner
 
         private void RefreshAdapterCombo(ComboBox box)
         {
-            AdapterInfo previous = box.SelectedItem as AdapterInfo;
-            string selectedId = previous == null ? null : previous.Id;
             box.Items.Clear();
             foreach (AdapterInfo adapter in adapters) box.Items.Add(adapter);
-            int index = adapters.FindIndex(x => String.Equals(x.Id, selectedId, StringComparison.OrdinalIgnoreCase));
+            int index = adapters.FindIndex(x => String.Equals(x.Id, selectedAdapterId, StringComparison.OrdinalIgnoreCase));
             if (index < 0 && adapters.Count > 0) index = 0;
             if (index >= 0) box.SelectedIndex = index;
+        }
+
+        private void SyncAdapterSelection(ComboBox source)
+        {
+            if (syncingAdapters) return;
+            AdapterInfo selected = source.SelectedItem as AdapterInfo;
+            if (selected == null) return;
+            selectedAdapterId = selected.Id;
+            syncingAdapters = true;
+            bool previousLoading = loading;
+            loading = true;
+            SetAdapterComboSelection(adapterBox, selectedAdapterId);
+            SetAdapterComboSelection(scanAdapterBox, selectedAdapterId);
+            SetAdapterComboSelection(pingAdapterBox, selectedAdapterId);
+            SetAdapterComboSelection(connectionAdapterBox, selectedAdapterId);
+            loading = previousLoading;
+            syncingAdapters = false;
+            PopulateFields();
+            PopulateScanNetworks(null, false, true);
+            PopulateGatewayTargetModes(pingAdapterBox, pingTargetModeBox, pingTargetBox, true);
+            PopulateGatewayTargetModes(connectionAdapterBox, connectionTargetModeBox, connectionHostBox, true);
+            UpdateDhcpButtons();
+        }
+
+        private static void SetAdapterComboSelection(ComboBox box, string adapterId)
+        {
+            for (int i = 0; i < box.Items.Count; i++)
+            {
+                AdapterInfo item = box.Items[i] as AdapterInfo;
+                if (item != null && String.Equals(item.Id, adapterId, StringComparison.OrdinalIgnoreCase))
+                {
+                    box.SelectedIndex = i;
+                    return;
+                }
+            }
         }
 
         private void PopulateGatewayTargetModes(ComboBox adapterChoice, ComboBox modeChoice, TextBox targetBox, bool updateTarget)
@@ -1918,6 +1956,7 @@ namespace NetworkCorner
                 fullHeightCheck.Checked = preferences.FullHeight;
                 hideDownCheck.Checked = preferences.HideDownAdapters;
                 if (preferences.SelectedTabIndex >= 0 && preferences.SelectedTabIndex < mainTabs.TabPages.Count) mainTabs.SelectedIndex = preferences.SelectedTabIndex;
+                selectedAdapterId = preferences.SelectedAdapterId;
                 loading = false;
             }
             catch { loading = false; }
@@ -1934,6 +1973,7 @@ namespace NetworkCorner
                     FullHeight = fullHeightCheck.Checked,
                     HideDownAdapters = hideDownCheck.Checked,
                     SelectedTabIndex = mainTabs.SelectedIndex,
+                    SelectedAdapterId = selectedAdapterId,
                     WindowWidth = Width,
                     WindowHeight = fullHeightCheck.Checked && normalHeight > 0 ? normalHeight : Height
                 };

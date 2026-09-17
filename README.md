@@ -35,7 +35,7 @@ Open the **Telnet / SSH** tab, choose an adapter, select its **Gateway IP** or a
 
 ## Network diagnostics
 
-The **Diagnostics** tab provides DNS lookup, traceroute, TCP port testing, public IP lookup, ARP table, routing table, and an elevated DNS-cache flush. Long-running command output streams into the results panel and can be stopped.
+The **Diagnostics** tab provides a quick built-in DNS lookup, Windows NSLookup with DNS-server details, traceroute, TCP port testing, public IP lookup, ARP table, routing table, and an elevated DNS-cache flush. Long-running command output streams into the results panel and can be stopped.
 
 To change settings:
 

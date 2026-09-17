@@ -1019,7 +1019,7 @@ namespace NetworkCorner
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 56));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 56));
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 180));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 220));
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             diagnosticsTab.Controls.Add(layout);
 
@@ -1048,20 +1048,22 @@ namespace NetworkCorner
             portRow.Controls.Add(diagnosticsPortBox, 1, 0);
             layout.Controls.Add(portRow, 0, 2);
 
-            var actions = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 4, BackColor = Back, Padding = new Padding(0, 5, 0, 5) };
+            var actions = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 5, BackColor = Back, Padding = new Padding(0, 5, 0, 5) };
             actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
             actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
-            for (int i = 0; i < 4; i++) actions.RowStyles.Add(new RowStyle(SizeType.Percent, 25));
+            for (int i = 0; i < 5; i++) actions.RowStyles.Add(new RowStyle(SizeType.Percent, 20));
             actions.Controls.Add(MakeButton("DNS lookup", delegate { RunDnsLookup(); }, false, 0), 0, 0);
-            actions.Controls.Add(MakeButton("Traceroute", delegate { RunTraceroute(); }, false, 0), 1, 0);
-            actions.Controls.Add(MakeButton("TCP port test", delegate { RunTcpPortTest(); }, false, 0), 0, 1);
-            actions.Controls.Add(MakeButton("Public IP", delegate { RunPublicIpLookup(); }, false, 0), 1, 1);
-            actions.Controls.Add(MakeButton("ARP table", delegate { StartDiagnosticProcess("ARP table", "arp.exe", "-a"); }, false, 0), 0, 2);
-            actions.Controls.Add(MakeButton("Routing table", delegate { StartDiagnosticProcess("Routing table", "route.exe", "print"); }, false, 0), 1, 2);
-            actions.Controls.Add(MakeButton("Flush DNS", delegate { FlushDns(); }, false, 0), 0, 3);
+            actions.Controls.Add(MakeButton("NSLookup", delegate { RunNslookup(); }, false, 0), 1, 0);
+            actions.Controls.Add(MakeButton("Traceroute", delegate { RunTraceroute(); }, false, 0), 0, 1);
+            actions.Controls.Add(MakeButton("TCP port test", delegate { RunTcpPortTest(); }, false, 0), 1, 1);
+            actions.Controls.Add(MakeButton("Public IP", delegate { RunPublicIpLookup(); }, false, 0), 0, 2);
+            actions.Controls.Add(MakeButton("ARP table", delegate { StartDiagnosticProcess("ARP table", "arp.exe", "-a"); }, false, 0), 1, 2);
+            actions.Controls.Add(MakeButton("Routing table", delegate { StartDiagnosticProcess("Routing table", "route.exe", "print"); }, false, 0), 0, 3);
+            actions.Controls.Add(MakeButton("Flush DNS", delegate { FlushDns(); }, false, 0), 1, 3);
             diagnosticsStopButton = MakeButton("Stop", delegate { StopDiagnostic(); }, false, 0);
             diagnosticsStopButton.Enabled = false;
-            actions.Controls.Add(diagnosticsStopButton, 1, 3);
+            actions.Controls.Add(diagnosticsStopButton, 0, 4);
+            actions.SetColumnSpan(diagnosticsStopButton, 2);
             layout.Controls.Add(actions, 0, 3);
 
             var outputPanel = Card();
@@ -1089,6 +1091,14 @@ namespace NetworkCorner
                 IPAddress[] addresses = Dns.GetHostAddresses(target);
                 return "DNS results for " + target + ":\r\n\r\n" + String.Join("\r\n", addresses.Select(x => x.ToString()).ToArray());
             });
+        }
+
+        private void RunNslookup()
+        {
+            string target = diagnosticsTargetBox.Text.Trim();
+            string validation = ConnectionSupport.ValidateHost(target);
+            if (validation != null) { MessageBox.Show(this, validation, "Check diagnostic target", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+            StartDiagnosticProcess("NSLookup", "nslookup.exe", target);
         }
 
         private void RunTraceroute()
